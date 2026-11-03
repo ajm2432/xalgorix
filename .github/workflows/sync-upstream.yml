@@ -1,0 +1,40 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          # PAT needed: GITHUB_TOKEN cannot push upstream changes to workflow files.
+          token: ${{ secrets.SYNC_TOKEN }}
+
+      - name: Fast-forward main from upstream
+        run: |
+          git remote add upstream https://github.com/xalgorix/xalgorix.git
+          git fetch upstream
+          git merge --ff-only upstream/main
+          git push origin main
+
+      - name: Open PR into seasidesec when main is ahead
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+        run: |
+          ahead=$(git rev-list --count origin/seasidesec..main)
+          open=$(gh pr list --base seasidesec --head main --state open --json number --jq length)
+          if [ "$ahead" -gt 0 ] && [ "$open" -eq 0 ]; then
+            gh pr create --base seasidesec --head main \
+              --title "Sync upstream Xalgorix" \
+              --body "Automated sync from xalgorix/xalgorix. Review, test against vulnlab, then merge."
+          fi
