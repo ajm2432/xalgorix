@@ -42,7 +42,7 @@ export function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
     <aside className="flex h-full w-60 shrink-0 flex-col border-r border-border bg-card">
       <div className="flex h-14 items-center gap-2 border-b border-border px-4">
         <div className="flex h-8 w-8 items-center justify-center overflow-hidden rounded-md border border-border bg-background">
-          <img src="/logo.png" alt="" className="h-full w-full object-cover" aria-hidden />
+          <img src="/logo.svg" alt="" className="h-full w-full object-cover" aria-hidden />
         </div>
         <div className="flex flex-col">
           <span className="text-sm font-semibold tracking-tight">Xalgorix</span>
