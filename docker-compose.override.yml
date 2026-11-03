@@ -1,0 +1,6 @@
+
+# SeasideSec local overrides. Compose merges this file automatically with docker-compose.yml.
+services:
+  xalgorix:
+    build: .
+    image: xalgorix:local

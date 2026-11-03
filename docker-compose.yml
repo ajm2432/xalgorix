@@ -9,8 +9,8 @@
 # volume). Set the env vars below only if you'd rather bake them in.
 services:
   xalgorix:
-    build: .
-    image: xalgorix:local
+    image: xalgord/xalgorix:latest
+    # Or build locally instead of pulling:  build: .
     #
     # Full host-like permissions so the engine's toolset behaves as it does when
     # run natively as root. Docker's DEFAULT sandbox drops capabilities
