@@ -30,6 +30,8 @@ jobs:
       - name: Open PR into seasidesec when main is ahead
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
+          # gh prefers a remote named "upstream", which would target xalgorix/xalgorix instead of this fork.
+          GH_REPO: ${{ github.repository }}
         run: |
           ahead=$(git rev-list --count origin/seasidesec..main)
           open=$(gh pr list --base seasidesec --head main --state open --json number --jq length)
