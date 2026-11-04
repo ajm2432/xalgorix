@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xalgord/xalgorix/v4/internal/agent"
 	"github.com/xalgord/xalgorix/v4/internal/config"
 )
 
@@ -50,12 +51,12 @@ func TestIsLocalProvider(t *testing.T) {
 
 func TestFormatCostNote(t *testing.T) {
 	// No tokens → stays silent.
-	if got := FormatCostNote(&config.Config{}, 0); got != "" {
+	if got := FormatCostNote(&config.Config{}, 0, 0); got != "" {
 		t.Errorf("FormatCostNote(_, 0) = %q, want empty", got)
 	}
 
 	// Remote provider: names the provider bill, the hosted nudge, and the URL.
-	remote := FormatCostNote(&config.Config{LLMProvider: "openai"}, 2_000_000)
+	remote := FormatCostNote(&config.Config{LLMProvider: "openai"}, 2_000_000, 0)
 	for _, want := range []string{
 		"2.00M tokens",
 		"billed to your own LLM provider",
@@ -67,12 +68,34 @@ func TestFormatCostNote(t *testing.T) {
 		}
 	}
 
+	// A provider-reported charge is printed as the scan's cost.
+	charged := FormatCostNote(&config.Config{LLMProvider: "openrouter"}, 2_000_000, 1.23456)
+	if !strings.Contains(charged, "reported a charge of $1.2346") {
+		t.Errorf("cost note missing the reported charge:\n%s", charged)
+	}
+
 	// Local provider: must NOT claim a provider bill.
-	local := FormatCostNote(&config.Config{LLMProvider: "ollama"}, 500_000)
+	local := FormatCostNote(&config.Config{LLMProvider: "ollama"}, 500_000, 0)
 	if strings.Contains(local, "billed to your own LLM provider") {
 		t.Errorf("local cost note wrongly claims a provider bill:\n%s", local)
 	}
 	if !strings.Contains(local, "local model") {
 		t.Errorf("local cost note should mention the local model:\n%s", local)
+	}
+}
+
+func TestOnlyTheRootAgentsFinishEndsTheCLIRun(t *testing.T) {
+	const root = "agent_1"
+	if rootFinished(agent.Event{Type: "finished", AgentID: "agent_2"}, root) {
+		t.Error("a subagent's finished event must not end the run")
+	}
+	if !rootFinished(agent.Event{Type: "finished", AgentID: root}, root) {
+		t.Error("the root agent's finished event must end the run")
+	}
+	if !rootFinished(agent.Event{Type: "finished"}, root) {
+		t.Error("an unattributed finished event must still end the run")
+	}
+	if rootFinished(agent.Event{Type: "message", AgentID: root}, root) {
+		t.Error("only finished events end the run")
 	}
 }

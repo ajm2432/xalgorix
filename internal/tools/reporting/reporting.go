@@ -824,6 +824,21 @@ If you cannot exploit it, downgrade severity to 'info' and report as information
 		}
 	}
 
+	// ── Gate 6.5: per-type severity caps are a ceiling ──
+	// Gate 6 lets a model-supplied CVSS raise the severity, which used to undo
+	// the Gate 5 caps (a missing header or rate limit capped at low came back
+	// as medium or high). Re-apply the caps last. A vector that claims more
+	// than this class of finding can be is dropped, so the stored score and
+	// severity agree; the default score for the capped severity is used.
+	if cappedSev, _ := classifySeverity(title, args["description"], severity, proof); cappedSev != severity {
+		if originalSeverity == "" {
+			originalSeverity = severity
+		}
+		severity = cappedSev
+		cvss = 0
+		cvssVector = ""
+	}
+
 	// If no CVSS provided, auto-assign a default CVSS based on severity
 	if cvss == 0 {
 		switch severity {
@@ -1968,7 +1983,7 @@ func findLedgerBrowserXSSProof(contextID, hypothesisID, target, endpoint string)
 			continue
 		}
 		for _, ev := range h.Evidence {
-			if strings.EqualFold(ev.Kind, "exploit") &&
+			if ev.EngineExploit() && strings.EqualFold(ev.Source, "verify_xss") &&
 				strings.Contains(strings.ToLower(ev.Summary), "browser-confirmed xss") {
 				request := strings.TrimSpace(ev.Request)
 				if targetHost != "" {
@@ -2188,22 +2203,22 @@ func ledgerVerifierProof(contextID, class string, selectors ...string) string {
 		if target != "" && h.Target != "" && !sameURLHost(target, h.Target) {
 			continue
 		}
-		// A verify_* tool authored this hypothesis, OR (robust to ledger dedup
-		// merging a verifier confirmation onto a pre-existing probe hypothesis,
-		// which can retain the probe's origin) an exploit evidence carries a
-		// verifier confirmation. Every verifier writes "CONFIRMED"/"confirmed"
-		// into its exploit-evidence summary only on a positive differential.
-		verifierOrigin := strings.HasPrefix(strings.ToLower(h.Origin), "verify_")
-		authzOrigin := strings.EqualFold(h.Origin, "authz_matrix")
+		// Only exploit evidence an engine verifier wrote counts (Evidence.Source,
+		// which the model's add_hypothesis_evidence can never set). Each
+		// verifier writes it only on a positive differential, so it is proof
+		// wherever ledger dedup merged it, including onto a probe or model
+		// record. Model-written text is never proof here, whatever it says
+		// ("not confirmed" contains "confirmed"), and neither is the model's
+		// own evidence on a verifier-originated hypothesis.
 		for _, ev := range h.Evidence {
-			if !strings.EqualFold(ev.Kind, "exploit") || strings.TrimSpace(ev.Summary) == "" {
+			if !ev.EngineExploit() || strings.TrimSpace(ev.Summary) == "" {
 				continue
 			}
 			s := strings.ToLower(ev.Summary)
 			switch {
-			case verifierOrigin, strings.Contains(s, "confirmed"):
+			case ev.Source != "authz_matrix":
 				return ev.Summary
-			case authzOrigin && strings.Contains(s, "broken access control"):
+			case strings.Contains(s, "broken access control"):
 				// authz_matrix's HIGH-confidence signal only: a lower identity got
 				// the SAME successful response as the authorized baseline (its
 				// exploit summary says "broken access control"). Its weaker
@@ -2313,7 +2328,7 @@ func findLedgerPathTraversalProof(contextID, hypothesisID, target, endpoint stri
 			}
 		}
 		for _, ev := range h.Evidence {
-			if strings.EqualFold(ev.Kind, "exploit") &&
+			if ev.EngineExploit() && strings.EqualFold(ev.Source, "verify_path_traversal") &&
 				strings.Contains(strings.ToLower(ev.Summary), "path traversal/local file read confirmed") &&
 				strings.Contains(ev.Request, "/../") &&
 				strings.Contains(ev.Response, "root:x:0:0") {
@@ -4115,6 +4130,9 @@ func extractVulnTypeWithCWE(title, description, cwe string) string {
 
 // normalizeEndpoint strips query params, fragments, and trailing slashes
 // so "/api/search?q=test" and "/api/search?q=foo" match as the same endpoint.
+// Only a URL's scheme and host are lowercased: paths are case-sensitive on most
+// servers, and a finding on a case-variant route (/Api/ next to /api/) must not
+// be deduplicated into the finding on the canonical one.
 func normalizeEndpoint(endpoint string) string {
 	endpoint = strings.TrimSpace(endpoint)
 	if endpoint == "" {
@@ -4131,8 +4149,16 @@ func normalizeEndpoint(endpoint string) string {
 	}
 	// Strip trailing slashes
 	endpoint = strings.TrimRight(endpoint, "/")
-	// Lowercase for consistent comparison
-	return strings.ToLower(endpoint)
+	// Lowercase the scheme and host only; the path keeps its case.
+	if i := strings.Index(endpoint, "://"); i >= 0 {
+		rest := endpoint[i+3:]
+		j := strings.IndexByte(rest, '/')
+		if j < 0 {
+			return strings.ToLower(endpoint)
+		}
+		return strings.ToLower(endpoint[:i+3+j]) + rest[j:]
+	}
+	return endpoint
 }
 
 type dedupTargetOrigin struct {
@@ -4262,14 +4288,14 @@ func isIDPathSegment(seg string) bool {
 	if numPathSegment.MatchString(seg) {
 		return true
 	}
-	// normalizeEndpoint already lowercased, but be defensive for direct callers.
+	// Paths keep their case, so match hex/UUID identifiers case-insensitively.
 	low := strings.ToLower(seg)
 	return uuidPathSegment.MatchString(low) || hexPathSegment.MatchString(low)
 }
 
 // templatePathParams collapses opaque per-object identifier segments in a path
 // to "{id}", so ID variants of the same endpoint share a key. It expects an
-// already query/fragment-stripped, lowercased path (see dedupEndpointKey).
+// already query/fragment-stripped path (see dedupEndpointKey).
 func templatePathParams(path string) string {
 	if path == "" || !strings.Contains(path, "/") {
 		return path

@@ -264,6 +264,11 @@ type Agent struct {
 	resumeFindings      []reporting.Vulnerability
 	publishedAssessment atomic.Pointer[assessmentSnapshot]
 	livenessExpired     atomic.Bool
+	// providerRetry marks that the previous iteration ended in an LLM provider
+	// retry (rate limit, overload, quota or error backoff). The model got no
+	// turn, so the next iteration must not count toward the idle limits.
+	// Touched only by the run loop goroutine.
+	providerRetry bool
 
 	// deferNoteSuppressed restores the specialist-wave defer detail latch
 	// across server restarts: a resumed run emits only compact defer notes
@@ -274,15 +279,18 @@ type Agent struct {
 	// agentGraph is shared by every agent delegated from this root, but owned
 	// by the root scan only. The graph itself is scan-scoped, so concurrent
 	// scans cannot overwrite runners or consume one another's worker slots.
-	agentGraph         *agentsgraph.Graph
-	ownsAgentGraph     bool
-	delegatedAgentID   string
-	ctfMission         bool
-	benchmarkIsolated  bool
-	scanBudget         *scanBudget
-	lastBudgetTokens   int
-	compactionCount    int
-	rateLimitBackoffFn func(int) time.Duration
+	agentGraph        *agentsgraph.Graph
+	ownsAgentGraph    bool
+	delegatedAgentID  string
+	ctfMission        bool
+	benchmarkIsolated bool
+	scanBudget        *scanBudget
+	lastBudgetTokens  int
+	// lastBudgetCostNanoUSD is this agent's reported cost already folded
+	// into scanBudget.costNanoUSD.
+	lastBudgetCostNanoUSD int64
+	compactionCount       int
+	rateLimitBackoffFn    func(int) time.Duration
 
 	// execTimeoutStreak counts consecutive exec-channel tools
 	// (terminal_execute/python_action) that hit the agent-level hard-timeout
@@ -1276,6 +1284,21 @@ func (a *Agent) CompletionOutcome() string {
 	return a.state.CompletionStatus
 }
 
+// CompletionStopReason returns the typed reason an "incomplete" assessment
+// carries to the scan record (finish_gate_exhausted, untested_at_finish), or
+// "" when none applies.
+func (a *Agent) CompletionStopReason() string {
+	if a != nil {
+		if snapshot := a.publishedAssessment.Load(); snapshot != nil {
+			return snapshot.StopReason
+		}
+	}
+	if a == nil || a.state == nil {
+		return ""
+	}
+	return a.state.CompletionStopReason
+}
+
 // SetPhaseRestrictions configures the selected methodology phases for policy hooks.
 // An empty slice means the full methodology is allowed.
 func (a *Agent) SetPhaseRestrictions(phases []int) {
@@ -1853,16 +1876,25 @@ func (a *Agent) Run(targets []string, instruction string) {
 		if !a.checkpointOrStop() {
 			return
 		}
-		if a.stopForHook(a.semanticLivenessCheck()) {
-			return
-		}
-		// Plan-complete, finding-idle finalizer: end the no-new-findings tail once
-		// the whole structured plan is exhausted (coverage churn alone keeps the
-		// semantic clock above alive, which let scans run many thousands of
-		// iterations past diminishing returns). A still-productive scan is never
-		// cut — any new finding resets the counter.
-		if a.autoFinalizeIfPlanComplete() {
-			return
+		// A provider retry is not a model turn: it must not spend the
+		// stuck-loop limit, the finish tail or the verification window. Each
+		// retry path is bounded on its own (the cumulative provider wait pauses
+		// the scan; plain errors stop after 25 attempts).
+		providerRetry := a.providerRetry
+		a.providerRetry = false
+		if !providerRetry {
+			if a.stopForHook(a.semanticLivenessCheck()) {
+				return
+			}
+			// Plan-complete, finding-idle finalizer: end the no-new-findings tail
+			// once the whole structured plan is exhausted (coverage churn alone
+			// keeps the semantic clock above alive, which let scans run many
+			// thousands of iterations past diminishing returns). A
+			// still-productive scan is never cut — any new finding resets the
+			// counter.
+			if a.autoFinalizeIfPlanComplete() {
+				return
+			}
 		}
 		if guardMsg := a.maybeCompletePassiveReconGuardAtIterationStart(iter); guardMsg != "" {
 			a.msgMu.Lock()
@@ -2038,6 +2070,10 @@ func (a *Agent) Run(targets []string, instruction string) {
 				// Log strictly to backend server logs for operator visibility (silent on user frontend)
 				a.logProviderWait(err, backoff, maxWait)
 
+				// Provider waiting time is not idle assessment time.
+				a.pauseIdleClock(backoff)
+				a.providerRetry = true
+
 				// Interruptible sleep: bail out immediately if the scan is stopped or canceled by operator.
 				if a.ctx != nil {
 					select {
@@ -2076,6 +2112,8 @@ func (a *Agent) Run(targets []string, instruction string) {
 			if backoff > 120*time.Second {
 				backoff = 120 * time.Second
 			}
+			a.pauseIdleClock(backoff)
+			a.providerRetry = true
 			if a.ctx != nil {
 				select {
 				case <-a.ctx.Done():
@@ -2373,7 +2411,11 @@ func (a *Agent) Run(targets []string, instruction string) {
 					if a.scanCtx != nil {
 						contextID = a.scanCtx.ID
 					}
-					normalized, note := terminal.NormalizeCommandForRequestRatePolicy(contextID, command)
+					// Fix options the tool would reject first, so the rate policy
+					// then caps the real flag (e.g. arjun --threads → -t).
+					normalized, flagNote := terminal.NormalizeToolFlags(command)
+					normalized, note := terminal.NormalizeCommandForRequestRatePolicy(contextID, normalized)
+					note = flagNote + note
 					normalized = terminal.InjectScanHeadersIntoCommand(normalized)
 					normalized = terminal.CapDirbusterRuntime(normalized)
 					if normalized != command {
@@ -2597,8 +2639,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 					// completed". Compute the explicit terminal state, make it
 					// visible in the final summary, and emit one compact
 					// telemetry block for post-scan debugging.
-					status, reasons := scanCompletionAssessment(a.state)
-					a.state.CompletionStatus = status
+					status, reasons := settleCompletion(a.state)
 					if status != CompletionStatusCompleted {
 						content += "\n\n" + formatIncompleteSummary(status, reasons)
 					}

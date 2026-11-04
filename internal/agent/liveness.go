@@ -218,6 +218,18 @@ func (a *Agent) semanticLivenessCheck() HookResult {
 	if a.state == nil || a.scanBudget == nil {
 		return HookResult{}
 	}
+	// Once the diminishing-returns finish tail is armed it bounds the scan, and
+	// a model spending many turns on one lead is what that tail exists to allow.
+	// Ending the scan here as stuck_loop_limit would skip the completion
+	// assessment, the residual record and the verification window. The idle
+	// clock still restarts every iteration, so the wall-clock watchdog keeps
+	// guarding against a single hung model request or tool wait.
+	if limit, _ := a.finishTailMode(); limit > 0 {
+		a.state.ProgressIdleIterations = 0
+		a.state.LastAssessmentProgress = a.AssessmentProgress()
+		a.resetProgressClock()
+		return HookResult{}
+	}
 	if a.semanticIdleRemaining() <= 0 {
 		// Iteration-driven stall where the wall-clock idle budget also happens to
 		// be spent: try to advance past the stuck task before giving up. (The
@@ -346,6 +358,23 @@ func (a *Agent) resetProgressClock() {
 	a.scanBudget.persistMu.Unlock()
 }
 
+// pauseIdleClock moves the wall-clock idle deadline forward by d, so time spent
+// waiting on the LLM provider (rate-limit, quota, overload or error backoff) is
+// not counted as time without assessment progress. Call it before the wait so
+// the watchdog goroutine does not fire mid-backoff. progressAt is checkpointed,
+// so a scan paused by a provider outage resumes with the idle budget it had.
+func (a *Agent) pauseIdleClock(d time.Duration) {
+	if a.scanBudget == nil || d <= 0 {
+		return
+	}
+	a.scanBudget.persistMu.Lock()
+	if a.scanBudget.progressAt.IsZero() {
+		a.scanBudget.progressAt = time.Now()
+	}
+	a.scanBudget.progressAt = a.scanBudget.progressAt.Add(d)
+	a.scanBudget.persistMu.Unlock()
+}
+
 // defaultPlanCompleteFindingIdle is how many iterations a root scan may run
 // after its plan is fully exhausted without proving any NEW finding before the
 // engine finalizes the assessment. It is generous on purpose: it only bounds
@@ -375,35 +404,9 @@ func (a *Agent) planCompleteFindingIdleLimit() int {
 // caller must then return from the run loop). Must be called exactly once per
 // iteration — it mutates the idle counter.
 func (a *Agent) autoFinalizeIfPlanComplete() bool {
-	if a.state == nil || a.scanBudget == nil || a.state.DelegatedAgent {
-		return false // root scans only; specialists close their own lane
-	}
-	if a.state.Iteration < a.state.MinIterations {
-		return false
-	}
-	if a.state.Plan == nil || len(a.state.Plan.Tasks) == 0 {
-		return false
-	}
-
-	// Terminal mode. Legacy: the plan is fully exhausted (no pending/active
-	// work). ConvergeFinish: the plan is SATURATED — the only open work is generic
-	// per-endpoint class coverage (and class-less exploratory tasks) past the
-	// route-coverage threshold, i.e. the unachievable every-route×every-class bar
-	// is in diminishing returns. Each mode has its own finding-idle tail; neither
-	// fires while any concrete/targeted work remains.
-	_, _, _, unfinished := a.PlanDisposition()
-	exhausted := unfinished == 0
-	saturated := false
-	limit := a.planCompleteFindingIdleLimit()
-	if !exhausted {
-		if !saturatedForFinish(a.state) {
-			return false
-		}
-		saturated = true
-		limit = a.convergeFinishIdleLimit()
-	}
+	limit, saturated := a.finishTailMode()
 	if limit <= 0 {
-		return false // disabled
+		return false // not in a terminal mode, or that mode's tail is disabled
 	}
 
 	cur := 0
@@ -413,24 +416,144 @@ func (a *Agent) autoFinalizeIfPlanComplete() bool {
 	if cur > a.state.LastFindingCount {
 		a.state.LastFindingCount = cur
 		a.state.FindingIdleIterations = 0
+		a.state.FindingIdleSince = time.Time{}
+		return false
+	}
+	if a.restartIdleTailOnNewLead() {
 		return false
 	}
 	a.state.FindingIdleIterations++
+	if a.state.FindingIdleIterations == 1 {
+		a.state.FindingIdleSince = time.Now()
+	}
 	if a.state.FindingIdleIterations < limit {
 		return false
 	}
+	if a.leadVerificationWindowHolds() {
+		return false
+	}
+	// Record the model's still-open leads before the ledger is settled, so the
+	// telemetry can list them for manual follow-up.
+	if a.state.ConvergeFinish {
+		if leads := activeVerificationLeads(a.state, time.Time{}); len(leads) > 0 {
+			a.state.UnverifiedLeadsAtFinish = formatLeadList(leads, 8)
+		}
+	}
 	// A saturated (not fully-exhausted) finish closes the remaining soft tasks so
-	// the plan reaches a clean terminal state and the residual (route,class) pairs
-	// are recorded before the honest completion assessment runs.
+	// the plan reaches a terminal state and the residual (route,class) pairs are
+	// recorded before the completion assessment runs.
 	if saturated {
 		closeSoftTasksForFinish(a.state)
 	}
-	// Settle dangling "testing" hypotheses as residual so the terminal status reads
-	// a clean "completed" instead of "incomplete" over an undrained claim backlog
-	// (flag-gated; no-op when ConvergeFinish is off).
+	// Settle dangling "testing" hypotheses as residual so the terminal status is
+	// not held "incomplete" by an undrained claim backlog (flag-gated; no-op when
+	// ConvergeFinish is off).
 	reconcileLedgerForFinish(a.state)
-	a.emitPlanCompleteFinish(cur, limit)
+	a.emitPlanCompleteFinish(cur, saturated)
 	return true
+}
+
+// finishTailMode reports whether a root scan is in a terminal mode whose
+// no-new-finding tail bounds it, and that tail's length (<= 0: no tail armed).
+// Legacy: the plan is fully exhausted (no pending/active work). ConvergeFinish:
+// the plan is SATURATED (saturated=true) — the only open work is generic
+// per-endpoint class coverage (and class-less exploratory tasks) past the
+// class-breadth threshold, i.e. the unachievable every-route×every-class bar is
+// in diminishing returns. Neither mode applies while concrete work remains.
+func (a *Agent) finishTailMode() (limit int, saturated bool) {
+	if a.state == nil || a.scanBudget == nil || a.state.DelegatedAgent {
+		return 0, false // root scans only; specialists close their own lane
+	}
+	if a.state.Iteration < a.state.MinIterations {
+		return 0, false
+	}
+	if a.state.Plan == nil || len(a.state.Plan.Tasks) == 0 {
+		return 0, false
+	}
+	if _, _, _, unfinished := a.PlanDisposition(); unfinished == 0 {
+		return a.planCompleteFindingIdleLimit(), false
+	}
+	if !saturatedForFinish(a.state) {
+		return 0, false
+	}
+	return a.convergeFinishIdleLimit(), true
+}
+
+// restartIdleTailOnNewLead restarts the finding-idle tail when the model has
+// recorded a NEW hypothesis since the last check: a scan that is still raising
+// fresh leads is not in diminishing returns, even before any is validated.
+// Only model-recorded hypotheses count (engine-generated candidates arrive by
+// the hundred), only while a tail is running, and at most maxLeadIdleResets
+// times per scan so termination stays guaranteed. ConvergeFinish-gated; the
+// legacy plan-exhausted path is unchanged. Returns true when it restarted.
+func (a *Agent) restartIdleTailOnNewLead() bool {
+	if !a.state.ConvergeFinish {
+		return false
+	}
+	n := modelHypothesisCount(a.state)
+	prev := a.state.LastModelHypothesisCount
+	a.state.LastModelHypothesisCount = n
+	if n <= prev || a.state.FindingIdleIterations == 0 {
+		return false // no new lead, or no tail running yet (baseline only)
+	}
+	if a.state.LeadIdleResets >= maxLeadIdleResets {
+		return false
+	}
+	a.state.LeadIdleResets++
+	a.state.FindingIdleIterations = 0
+	a.state.FindingIdleSince = time.Time{}
+	a.emit(Event{Type: "message", Content: fmt.Sprintf("🔁 New hypothesis recorded: the diminishing-returns tail restarted (%d/%d restarts used).", a.state.LeadIdleResets, maxLeadIdleResets), TotalTokens: a.syncBudgetTokens()})
+	return true
+}
+
+// leadVerificationWindowHolds grants ONE bounded verification window when the
+// tail elapses while the model still holds recent, high-confidence, unverified
+// leads. The model is asked to conclude each lead (report it if the evidence
+// meets the reporting bar, otherwise reject it) instead of the scan closing
+// mid-verification. The window ends after convergeLeadWindow iterations, or
+// earlier once none of those leads is open. ConvergeFinish-gated.
+func (a *Agent) leadVerificationWindowHolds() bool {
+	if !a.state.ConvergeFinish {
+		return false
+	}
+	window := a.convergeLeadWindow()
+	if window <= 0 {
+		return false
+	}
+	if a.state.LeadWindowStartIteration > 0 {
+		// Count the turns the window actually held rather than the iteration
+		// delta: provider retries advance the iteration number without giving
+		// the model a turn, and must not use up the window.
+		a.state.LeadWindowIterations++
+		if a.state.LeadWindowIterations >= window {
+			return false
+		}
+		return len(activeVerificationLeads(a.state, a.state.LeadWindowSince)) > 0
+	}
+	leads := activeVerificationLeads(a.state, a.state.FindingIdleSince)
+	if len(leads) == 0 {
+		return false
+	}
+	start := a.state.Iteration
+	if start < 1 {
+		start = 1
+	}
+	a.state.LeadWindowStartIteration = start
+	a.state.LeadWindowSince = a.state.FindingIdleSince
+	directive := fmt.Sprintf("⏳ VERIFICATION WINDOW (%d iterations): no new finding has been validated for the diminishing-returns tail, so the engine will finalize the assessment after this window. Before then, conclude each open lead: %s. For each one, either verify it and report it with report_vulnerability if the evidence meets the normal reporting standard, or reject it with update_hypothesis and a one-line reason. Do not start unrelated work.",
+		window, formatLeadList(leads, 8))
+	a.appendUserNudge(directive)
+	a.emit(Event{Type: "message", Content: directive, TotalTokens: a.syncBudgetTokens()})
+	return true
+}
+
+// convergeLeadWindow is the verification-window length. A nonzero cfg override
+// wins (negative disables, surfaced as <= 0); otherwise the built-in default.
+func (a *Agent) convergeLeadWindow() int {
+	if a.cfg != nil && a.cfg.ConvergeFinishLeadWindow != 0 {
+		return a.cfg.ConvergeFinishLeadWindow
+	}
+	return convergeFinishDefaultLeadWindow
 }
 
 // convergeFinishIdleLimit is the no-new-finding tail for the ConvergeFinish
@@ -447,11 +570,18 @@ func (a *Agent) convergeFinishIdleLimit() int {
 // the same honest terminal path as a model-issued finish (authoritative
 // summary, completion-status assessment, telemetry), so the terminal event is
 // indistinguishable from a normal graceful completion and never loses findings.
-func (a *Agent) emitPlanCompleteFinish(findingCount, limit int) {
-	content := fmt.Sprintf("Assessment finalized: the structural plan is fully exhausted and no new finding was validated in the last %d iterations (diminishing-returns tail). Findings already reported are preserved.", limit)
+func (a *Agent) emitPlanCompleteFinish(findingCount int, saturated bool) {
+	idle := a.state.FindingIdleIterations
+	content := fmt.Sprintf("Assessment finalized: the structural plan is fully exhausted and no new finding was validated in the last %d iterations (diminishing-returns tail). Findings already reported are preserved.", idle)
+	if saturated {
+		// The saturated finish closes work it never ran; say so instead of
+		// claiming the plan was exhausted.
+		touched, applicable := routeTouchCounts(a.state)
+		content = fmt.Sprintf("Assessment finalized at coverage saturation: no new finding was validated in the last %d iterations (diminishing-returns tail). %d plan task(s) were closed WITHOUT being executed and are recorded as untested residual; %d/%d applicable injectable routes were tested. Findings already reported are preserved.",
+			idle, untestedAtFinishCount(a.state), touched, applicable)
+	}
 	content = authoritativeFinishSummary(content, findingCount)
-	status, reasons := scanCompletionAssessment(a.state)
-	a.state.CompletionStatus = status
+	status, reasons := settleCompletion(a.state)
 	if status != CompletionStatusCompleted {
 		content += "\n\n" + formatIncompleteSummary(status, reasons)
 	}

@@ -98,6 +98,11 @@ type Evidence struct {
 	// AgentID records which agent (coordinator or a specialist delegation ID)
 	// contributed the evidence.
 	AgentID string `json:"agent_id,omitempty"`
+	// Source names the engine verifier that wrote this evidence (for example
+	// "verify_sqli"). Only engine code sets it; evidence the model records
+	// itself (add_hypothesis_evidence) never carries one, so proof gates can
+	// tell an engine confirmation from model-written text.
+	Source string `json:"source,omitempty"`
 	// Confidence is the quality of THIS observation in [0,1].
 	Confidence float64   `json:"confidence,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -213,8 +218,10 @@ func (ls *LedgerStore) SetPersistPath(dir string) {
 // Dedup: if in.DedupKey is empty it is derived from (VulnClass, Endpoint,
 // Parameter, Role). Non-empty scalar fields on `in` overwrite blanks on the
 // existing record; identity fields are never blanked once set. Status and
-// Confidence are only advanced by the dedicated methods, so Upsert does not
-// silently regress a proven hypothesis back to queued.
+// Confidence are otherwise only advanced by the dedicated methods, so Upsert
+// never regresses a proven hypothesis back to queued; the one exception is a
+// model-recorded lead merging into an engine seed, which may only raise them
+// (see mergeFrom).
 func (ls *LedgerStore) Upsert(in Hypothesis) Hypothesis {
 	now := time.Now().UTC()
 	in.sanitize()
@@ -649,11 +656,13 @@ func (ls *LedgerStore) LoadFromDisk() int {
 		if h == nil {
 			continue
 		}
+		// Ledgers written before endpoint keys kept their path case store a
+		// lowercased key; re-derive it so new records for the same route merge.
 		key := h.DedupKey
-		if key == "" {
-			key = dedupKey(h.VulnClass, h.Endpoint, h.Parameter, h.Role)
-			h.DedupKey = key
+		if derived := dedupKey(h.VulnClass, h.Endpoint, h.Parameter, h.Role); key == "" || strings.EqualFold(key, derived) {
+			key = derived
 		}
+		h.DedupKey = key
 		if _, exists := ls.byDedup[key]; exists {
 			continue // do not clobber live state
 		}
@@ -788,6 +797,30 @@ func (h *Hypothesis) mergeFrom(src Hypothesis) {
 	if h.Origin == "" && src.Origin != "" {
 		h.Origin = src.Origin
 	}
+	// A lead the model records itself can land on an engine-seeded placeholder
+	// with the same class/endpoint/parameter/role. The model's record takes the
+	// placeholder over: it adopts the model origin and the model's confidence
+	// and may advance queued → testing. It only ever raises — a settled status
+	// or a higher confidence is never regressed (dedicated methods own those).
+	if IsModelOrigin(src.Origin) {
+		if !IsModelOrigin(h.Origin) {
+			h.Origin = src.Origin
+		}
+		if src.Confidence > h.Confidence {
+			h.Confidence = src.Confidence
+		}
+		if h.Status == HypothesisQueued && src.Status == HypothesisTesting {
+			h.Status = HypothesisTesting
+		}
+	}
+}
+
+// IsModelOrigin reports whether an Origin marks a hypothesis the model recorded
+// itself (record_hypothesis from the coordinator, "coordinator", or from a
+// delegated specialist, "agent_<id>"), as opposed to engine-generated seeds,
+// verifier records or imports.
+func IsModelOrigin(origin string) bool {
+	return origin == "coordinator" || strings.HasPrefix(origin, "agent_")
 }
 
 // sanitize bounds and normalizes external hypothesis input.
@@ -828,7 +861,27 @@ func (ev *Evidence) sanitize() {
 	ev.Response = truncate(ev.Response, maxEvidenceStringLen)
 	ev.FindingID = truncate(strings.TrimSpace(ev.FindingID), maxHypothesisFieldLen)
 	ev.AgentID = truncate(strings.TrimSpace(ev.AgentID), maxHypothesisFieldLen)
+	ev.Source = truncate(strings.TrimSpace(ev.Source), maxHypothesisFieldLen)
 	ev.Confidence = clampConfidence(ev.Confidence)
+}
+
+// EngineExploit reports whether this is exploit evidence written by an engine
+// verifier (see Evidence.Source), as opposed to the model's own text.
+func (ev Evidence) EngineExploit() bool {
+	return ev.Source != "" && strings.EqualFold(ev.Kind, "exploit")
+}
+
+// HasEngineExploit reports whether an engine verifier recorded exploit
+// evidence on this hypothesis. Such a hypothesis is never auto-settled as
+// exhausted: the engine saw the vulnerability, so only the model (report or
+// reject) or a human may conclude it.
+func (h Hypothesis) HasEngineExploit() bool {
+	for _, ev := range h.Evidence {
+		if ev.EngineExploit() {
+			return true
+		}
+	}
+	return false
 }
 
 // capEvidence bounds evidence per hypothesis, evicting the oldest non-finding
@@ -864,18 +917,37 @@ func dedupKey(vulnClass, endpoint, parameter, role string) string {
 	}, "|")
 }
 
-// normalizeEndpoint lowercases, drops the query/fragment, and trims a trailing
-// slash so "/a/?x=1" and "/A/" collapse to the same key.
+// normalizeEndpoint drops the query/fragment, trims a trailing slash and
+// lowercases only a URL's scheme and host, so "/a/?x=1" and "/a/" share a key.
+// The path keeps its case: most servers route paths case-sensitively, and a
+// case variant of a route (/Api/ next to /api/) is separate surface — an
+// authorization bypass through a case-variant mount is exactly that, and
+// merging the two records loses its evidence.
 func normalizeEndpoint(endpoint string) string {
 	e := strings.TrimSpace(endpoint)
 	if i := strings.IndexAny(e, "?#"); i >= 0 {
 		e = e[:i]
 	}
-	e = strings.ToLower(e)
+	e = lowerSchemeHost(e)
 	if len(e) > 1 {
 		e = strings.TrimRight(e, "/")
 	}
 	return e
+}
+
+// lowerSchemeHost lowercases the "scheme://host[:port]" prefix of an absolute
+// URL and leaves the path as written. Paths without a scheme are unchanged.
+func lowerSchemeHost(e string) string {
+	i := strings.Index(e, "://")
+	if i < 0 {
+		return e
+	}
+	rest := e[i+3:]
+	j := strings.IndexByte(rest, '/')
+	if j < 0 {
+		return strings.ToLower(e)
+	}
+	return strings.ToLower(e[:i+3+j]) + rest[j:]
 }
 
 func clampConfidence(f float64) float64 {
