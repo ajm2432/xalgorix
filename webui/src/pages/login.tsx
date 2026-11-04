@@ -84,8 +84,8 @@ export default function LoginPage() {
     <div className="grid min-h-screen w-full bg-background lg:grid-cols-2">
       <div className="hidden flex-col justify-between border-r border-border bg-muted/30 p-12 lg:flex">
         <div className="flex items-center gap-3">
-          <img src="/logo.svg" alt="SeasideSec" className="h-8 w-8 rounded-md" />
-          <span className="font-mono text-sm font-semibold tracking-tight">XALGORIX</span>
+          <img src="/logo.svg" alt="" className="h-8 w-8" aria-hidden />
+          <span className="text-base font-medium">SeasideSec</span>
         </div>
         <div className="space-y-6">
           <div className="space-y-2">
@@ -104,14 +104,14 @@ export default function LoginPage() {
             <Stat label="Coverage" value="98.4%" />
           </dl>
         </div>
-        <p className="text-xs text-muted-foreground">© Xalgorix · Internal use only</p>
+        <p className="text-xs text-muted-foreground">© SeasideSec · Internal use only</p>
       </div>
 
       <div className="flex items-center justify-center p-6 sm:p-12">
         <div className="w-full max-w-sm">
           <div className="mb-8 flex items-center gap-3 lg:hidden">
-            <img src="/logo.svg" alt="SeasideSec" className="h-8 w-8 rounded-md" />
-            <span className="font-mono text-sm font-semibold tracking-tight">XALGORIX</span>
+            <img src="/logo.svg" alt="" className="h-8 w-8" aria-hidden />
+            <span className="text-base font-medium">SeasideSec</span>
           </div>
           <Card>
             <CardHeader>

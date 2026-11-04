@@ -21,8 +21,8 @@ const STORAGE_KEY = "xalgorix.theme";
 // Kept in sync with --background in styles.css so the mobile browser chrome
 // matches the app surface.
 const THEME_COLOR: Record<ResolvedTheme, string> = {
-  light: "#ffffff",
-  dark: "#050505",
+  light: "#f7f7f8",
+  dark: "#141415",
 };
 
 function isThemeMode(v: unknown): v is ThemeMode {

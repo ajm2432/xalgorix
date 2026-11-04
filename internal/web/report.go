@@ -40,19 +40,19 @@ type reportPalette struct {
 
 func themeReportPalette() reportPalette {
 	return reportPalette{
-		bg:       [3]int{5, 5, 5},       // #050505
-		card:     [3]int{10, 10, 10},    // #0a0a0a
-		muted:    [3]int{17, 17, 17},    // #111111
-		border:   [3]int{38, 38, 38},    // #262626
-		fg:       [3]int{250, 250, 250}, // #fafafa
-		subtle:   [3]int{161, 161, 170}, // #a1a1aa
-		accent:   [3]int{16, 185, 129},  // #10b981
-		critical: [3]int{220, 38, 38},   // #dc2626
-		high:     [3]int{234, 88, 12},   // #ea580c
-		medium:   [3]int{202, 138, 4},   // #ca8a04
-		low:      [3]int{37, 99, 235},   // #2563eb
-		info:     [3]int{82, 82, 82},    // #525252
-		code:     [3]int{23, 23, 23},    // #171717
+		bg:       [3]int{20, 20, 21},    // #141415
+		card:     [3]int{25, 25, 27},    // #19191b
+		muted:    [3]int{35, 35, 37},    // #232325
+		border:   [3]int{44, 44, 47},    // #2c2c2f
+		fg:       [3]int{237, 237, 237}, // #ededed
+		subtle:   [3]int{161, 161, 166}, // #a1a1a6
+		accent:   [3]int{45, 212, 191},  // #2dd4bf
+		critical: [3]int{229, 72, 77},   // #e5484d
+		high:     [3]int{229, 161, 58},  // #e5a13a
+		medium:   [3]int{161, 161, 166}, // #a1a1a6
+		low:      [3]int{133, 133, 139}, // #85858b
+		info:     [3]int{90, 90, 96},    // #5a5a60
+		code:     [3]int{15, 15, 16},    // #0f0f10
 	}
 }
 
@@ -682,7 +682,7 @@ func (s *Server) generateReport(scan *ScanRecord) (string, error) {
 	pdf.Ln(8)
 	pdf.SetFont("Helvetica", "B", 10)
 	setColor(white)
-	pdf.CellFormat(182, 5, "Xalgorix", "", 1, "L", false, 0, "")
+	pdf.CellFormat(182, 5, "SeasideSec", "", 1, "L", false, 0, "")
 	pdf.SetFont("Helvetica", "", 8)
 	setColor(gray)
 	pdf.CellFormat(182, 5, tr("Autonomous AI-powered security assessment"), "", 1, "L", false, 0, "")
@@ -872,7 +872,7 @@ func (s *Server) generateReport(scan *ScanRecord) (string, error) {
 	pdf.SetFont("Helvetica", "", 9)
 	setColor(white)
 	pdf.SetX(10)
-	pdf.MultiCell(190, 4.5, tr("Xalgorix follows a comprehensive 22-phase penetration testing methodology "+
+	pdf.MultiCell(190, 4.5, tr("SeasideSec follows a comprehensive 22-phase penetration testing methodology "+
 		"aligned with OWASP, PTES, and industry best practices. Each phase is executed by an autonomous AI agent "+
 		"with tool access to terminal, browser, and specialized security utilities."), "", "L", false)
 	pdf.Ln(4)
@@ -1802,7 +1802,7 @@ func (s *Server) generateReport(scan *ScanRecord) (string, error) {
 	if strings.TrimSpace(reportID) == "" {
 		reportID = "scan"
 	}
-	filename := fmt.Sprintf("xalgorix_report_%s.pdf", reportID)
+	filename := fmt.Sprintf("seasidesec_report_%s.pdf", reportID)
 	// Try saving to the scan directory first, fall back to dataDir
 	outPath := filepath.Join(s.currentScanDir, filename)
 	if s.currentScanDir == "" {

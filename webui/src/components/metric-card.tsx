@@ -21,12 +21,12 @@ export function MetricCard({
 }) {
   const accentClass =
     accent === "critical"
-      ? "text-red-600 dark:text-red-400"
+      ? "bg-severity-critical"
       : accent === "warning"
-        ? "text-amber-600 dark:text-amber-400"
+        ? "bg-warning"
         : accent === "success"
-          ? "text-emerald-600 dark:text-emerald-400"
-          : "text-foreground";
+          ? "bg-success"
+          : null;
 
   const body = (
     <div
@@ -34,22 +34,20 @@ export function MetricCard({
         // h-full + flex column keeps every card in a row the same height,
         // even when some have a hint and others don't, and prevents the
         // 6-col grid from looking ragged when labels truncate differently.
-        "group flex h-full flex-col rounded-md border border-border bg-card p-4 transition-colors card-hover",
+        "group flex h-full flex-col rounded-lg border border-border bg-card p-5 transition-colors card-hover",
         to && "cursor-pointer",
         className,
       )}
     >
       <div className="flex items-start justify-between gap-2">
-        <p className="truncate text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-          {label}
+        <p className="flex min-w-0 items-center gap-2 text-[13px] text-muted-foreground">
+          {accentClass && <span className={cn("h-2 w-2 shrink-0 rounded-full", accentClass)} aria-hidden />}
+          <span className="truncate">{label}</span>
         </p>
         {icon && <span className="shrink-0 text-muted-foreground">{icon}</span>}
       </div>
       <div
-        className={cn(
-          "mt-3 truncate text-3xl font-semibold leading-none tabular-nums",
-          accentClass,
-        )}
+        className="mt-2 truncate text-[28px] font-medium leading-9 tabular-nums text-foreground"
         title={typeof value === "string" || typeof value === "number" ? String(value) : undefined}
       >
         {value}
@@ -62,7 +60,7 @@ export function MetricCard({
     </div>
   );
   return to ? (
-    <Link to={to} className="block focus:outline-none focus:ring-1 focus:ring-ring rounded-md">
+    <Link to={to} className="block focus:outline-none focus:ring-1 focus:ring-ring rounded-lg">
       {body}
     </Link>
   ) : (

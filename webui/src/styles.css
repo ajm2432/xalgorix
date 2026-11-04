@@ -1,64 +1,62 @@
 @import "tailwindcss";
+@import "@fontsource-variable/instrument-sans";
 
 /* Class-based dark mode: `dark:` utilities and the token overrides in `.dark`
    below apply when <html> carries the `dark` class (toggled at runtime by the
    theme store), instead of the OS `prefers-color-scheme` media query. */
 @custom-variant dark (&:where(.dark, .dark *));
 
-/* Geist + Vercel-inspired design tokens for Xalgorix. Values live on :root
-   (light) and .dark (dark); the @theme inline block below maps them to
-   Tailwind color utilities so background, text and border classes resolve
-   against the active theme. The crimson brand accent is intentionally
-   identical to the Xalgorix SaaS tokens so the dashboard and hosted product
-   share one accent — the brand oklch values are the same in both themes;
-   change them together. */
+/* SeasideSec portal palette: neutral surfaces, a light primary button and a
+   single teal accent kept for focus rings and active states. Values live on
+   :root (light) and .dark (dark); the @theme inline block below maps them to
+   Tailwind color utilities. */
 :root {
-  --background: #ffffff;
-  --foreground: #0a0a0a;
+  --background: #f7f7f8;
+  --foreground: #18181b;
 
   --card: #ffffff;
-  --card-foreground: #0a0a0a;
-  --card-hover: #f7f7f8;
-  --card-hover-border: #d4d4d8;
+  --card-foreground: #18181b;
+  --card-hover: #fafafa;
+  --card-hover-border: rgba(24, 24, 27, 0.16);
 
   --popover: #ffffff;
-  --popover-foreground: #0a0a0a;
+  --popover-foreground: #18181b;
 
-  --brand: oklch(0.56 0.22 20);
-  --brand-foreground: oklch(0.985 0 0);
-  --brand-hover: oklch(0.52 0.22 20);
-  --brand-subtle: oklch(0.95 0.03 20);
-  --brand-border: oklch(0.85 0.07 20);
+  --brand: #0d9488;
+  --brand-foreground: #ffffff;
+  --brand-hover: #0f766e;
+  --brand-subtle: #ececef;
+  --brand-border: rgba(24, 24, 27, 0.16);
 
-  --primary: var(--brand);
-  --primary-foreground: var(--brand-foreground);
+  --primary: #18181b;
+  --primary-foreground: #ffffff;
 
-  --secondary: #f4f4f5;
+  --secondary: #ececef;
   --secondary-foreground: #18181b;
 
-  --muted: #f4f4f5;
+  --muted: #ececef;
   --muted-foreground: #52525b;
 
-  --accent: var(--brand-subtle);
-  --accent-foreground: oklch(0.45 0.19 20);
+  --accent: #ececef;
+  --accent-foreground: #18181b;
 
-  --border: #e4e4e7;
-  --input: #e4e4e7;
-  --ring: oklch(0.65 0.22 20);
+  --border: rgba(24, 24, 27, 0.08);
+  --input: rgba(24, 24, 27, 0.16);
+  --ring: #0d9488;
 
-  --destructive: #dc2626;
-  --destructive-foreground: #fafafa;
+  --destructive: #d93036;
+  --destructive-foreground: #ffffff;
 
-  --severity-critical: #dc2626;
-  --severity-high: #ea580c;
-  --severity-medium: #ca8a04;
-  --severity-low: #2563eb;
-  --severity-info: #525252;
+  --severity-critical: #d93036;
+  --severity-high: #b7791f;
+  --severity-medium: #a1a1a6;
+  --severity-low: #71717a;
+  --severity-info: #a1a1aa;
 
-  --success: #059669;
-  --warning: #d97706;
+  --success: #1f9d63;
+  --warning: #b7791f;
 
-  --selection-bg: #0a0a0a;
+  --selection-bg: #18181b;
   --selection-fg: #ffffff;
   --scrollbar-thumb: #d4d4d8;
   --scrollbar-thumb-hover: #b4b4bb;
@@ -67,55 +65,55 @@
 }
 
 .dark {
-  --background: #050505;
-  --foreground: #fafafa;
+  --background: #141415;
+  --foreground: #ededed;
 
-  --card: #0a0a0a;
-  --card-foreground: #fafafa;
-  --card-hover: #0d0d0d;
-  --card-hover-border: #2f2f2f;
+  --card: #19191b;
+  --card-foreground: #ededed;
+  --card-hover: #1d1d1f;
+  --card-hover-border: rgba(237, 237, 237, 0.16);
 
-  --popover: #0a0a0a;
-  --popover-foreground: #fafafa;
+  --popover: #19191b;
+  --popover-foreground: #ededed;
 
-  --brand: oklch(0.56 0.22 20);
-  --brand-foreground: oklch(0.985 0 0);
-  --brand-hover: oklch(0.52 0.22 20);
-  --brand-subtle: oklch(0.2 0.035 20);
-  --brand-border: oklch(0.4 0.12 20);
+  --brand: #2dd4bf;
+  --brand-foreground: #08201c;
+  --brand-hover: #5eead4;
+  --brand-subtle: #232325;
+  --brand-border: rgba(237, 237, 237, 0.16);
 
-  --primary: var(--brand);
-  --primary-foreground: var(--brand-foreground);
+  --primary: #ededed;
+  --primary-foreground: #141415;
 
-  --secondary: #111111;
-  --secondary-foreground: #fafafa;
+  --secondary: #232325;
+  --secondary-foreground: #ededed;
 
-  --muted: #111111;
-  --muted-foreground: #a1a1aa;
+  --muted: #232325;
+  --muted-foreground: #a1a1a6;
 
-  --accent: var(--brand-subtle);
-  --accent-foreground: oklch(0.985 0 0);
+  --accent: #232325;
+  --accent-foreground: #ededed;
 
-  --border: #262626;
-  --input: #1a1a1a;
-  --ring: oklch(0.65 0.22 20);
+  --border: rgba(237, 237, 237, 0.08);
+  --input: rgba(237, 237, 237, 0.16);
+  --ring: #2dd4bf;
 
-  --destructive: #ef4444;
-  --destructive-foreground: #fafafa;
+  --destructive: #e5484d;
+  --destructive-foreground: #ffffff;
 
-  --severity-critical: #dc2626;
-  --severity-high: #ea580c;
-  --severity-medium: #ca8a04;
-  --severity-low: #2563eb;
-  --severity-info: #525252;
+  --severity-critical: #e5484d;
+  --severity-high: #e5a13a;
+  --severity-medium: #a1a1a6;
+  --severity-low: #5a5a60;
+  --severity-info: #85858b;
 
-  --success: #10b981;
-  --warning: #f59e0b;
+  --success: #4cc38a;
+  --warning: #e5a13a;
 
-  --selection-bg: #ffffff;
-  --selection-fg: #000000;
-  --scrollbar-thumb: #1a1a1a;
-  --scrollbar-thumb-hover: #2a2a2a;
+  --selection-bg: #ededed;
+  --selection-fg: #141415;
+  --scrollbar-thumb: #2a2a2d;
+  --scrollbar-thumb-hover: #3a3a3d;
 
   color-scheme: dark;
 }
@@ -168,11 +166,11 @@
   --color-warning: var(--warning);
 
   --radius-sm: 6px;
-  --radius-md: 10px;
-  --radius-lg: 12px;
+  --radius-md: 8px;
+  --radius-lg: 14px;
 
   --font-sans:
-    "Geist", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Instrument Sans Variable", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     Helvetica, Arial, sans-serif;
   --font-mono:
     "Geist Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas,
@@ -193,51 +191,6 @@
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
     overflow: hidden;
-  }
-
-  /* Crosshair "radar target" motif in the top-right, mirroring the Xalgorix SaaS
-     backdrop: centre dot, crosshair, conic tick marks and concentric rings, all
-     faded out by a radial mask. Decorative only — pointer-events are disabled
-     and #root sits above it. */
-  body::before {
-    content: "";
-    position: fixed;
-    top: clamp(72px, 12vh, 140px);
-    right: clamp(-120px, -4vw, -36px);
-    width: clamp(280px, 32vw, 440px);
-    aspect-ratio: 1;
-    z-index: 0;
-    pointer-events: none;
-    background:
-      linear-gradient(
-        to right,
-        transparent 49.7%,
-        color-mix(in oklch, var(--color-brand) 10%, transparent) 49.8% 50.2%,
-        transparent 50.3%
-      ),
-      linear-gradient(
-        to bottom,
-        transparent 49.7%,
-        color-mix(in oklch, var(--color-brand) 10%, transparent) 49.8% 50.2%,
-        transparent 50.3%
-      ),
-      repeating-conic-gradient(
-        from 22.5deg at center,
-        color-mix(in oklch, var(--color-brand) 4%, transparent) 0 0.2deg,
-        transparent 0.2deg 45deg
-      ),
-      radial-gradient(
-        circle at center,
-        color-mix(in oklch, var(--color-brand) 10%, transparent) 0 1.5%,
-        transparent 1.8% 18%,
-        color-mix(in oklch, var(--color-brand) 12%, transparent) 18.2% 18.55%,
-        transparent 18.8% 32%,
-        color-mix(in oklch, var(--color-brand) 8%, transparent) 32.2% 32.55%,
-        transparent 32.8% 46%,
-        color-mix(in oklch, var(--color-brand) 5%, transparent) 46.2% 46.45%,
-        transparent 46.7%
-      );
-    mask-image: radial-gradient(circle, black 0 62%, transparent 78%);
   }
 
   #root {

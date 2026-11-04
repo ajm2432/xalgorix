@@ -2,38 +2,14 @@ import { cn } from "@/lib/utils";
 import { useI18n } from "@/i18n";
 
 const STYLES: Record<string, { className: string; label: string }> = {
-  running: {
-    className: "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400 border-emerald-500/30",
-    label: "Running",
-  },
-  pending: {
-    className: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
-    label: "Pending",
-  },
-  paused: {
-    className: "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
-    label: "Paused",
-  },
-  saved: {
-    className: "bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/30",
-    label: "Saved",
-  },
-  finished: {
-    className: "bg-neutral-500/10 text-neutral-600 dark:text-neutral-300 border-neutral-500/30",
-    label: "Completed",
-  },
-  completed: {
-    className: "bg-neutral-500/10 text-neutral-600 dark:text-neutral-300 border-neutral-500/30",
-    label: "Completed",
-  },
-  stopped: {
-    className: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30",
-    label: "Stopped",
-  },
-  failed: {
-    className: "bg-red-500/10 text-red-600 dark:text-red-400 border-red-500/30",
-    label: "Failed",
-  },
+  running: { className: "bg-brand", label: "Running" },
+  pending: { className: "bg-warning", label: "Pending" },
+  paused: { className: "bg-warning", label: "Paused" },
+  saved: { className: "bg-severity-info", label: "Saved" },
+  finished: { className: "bg-success", label: "Completed" },
+  completed: { className: "bg-success", label: "Completed" },
+  stopped: { className: "bg-severity-info", label: "Stopped" },
+  failed: { className: "bg-destructive", label: "Failed" },
 };
 
 export function ScanStatusPill({
@@ -46,7 +22,7 @@ export function ScanStatusPill({
   const { t } = useI18n();
   const key = (status || "").toLowerCase();
   const meta = STYLES[key] || {
-    className: "bg-neutral-500/10 text-neutral-600 dark:text-neutral-300 border-neutral-500/30",
+    className: "bg-severity-info",
     label: status || "Unknown",
   };
   // Localize known statuses; fall back to the built-in English label.
@@ -56,13 +32,12 @@ export function ScanStatusPill({
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide",
-        meta.className,
+        "inline-flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground",
         className,
       )}
     >
       <span
-        className={cn("h-1.5 w-1.5 rounded-full bg-current", dotPulse)}
+        className={cn("h-2 w-2 rounded-full", meta.className, dotPulse)}
         aria-hidden
       />
       {localizedLabel}
