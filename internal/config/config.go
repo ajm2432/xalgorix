@@ -103,7 +103,7 @@ type Config struct {
 	// retrieves the byte-identical original). The recent window stays
 	// verbatim, so every byte the model could previously see remains
 	// reachable — it is fetched on demand instead of being resent on every
-	// iteration. XALGORIX_BOUNDED_CONTEXT, default false (off).
+	// iteration. XALGORIX_BOUNDED_CONTEXT, default true (on).
 	BoundedContext bool
 
 	// EpochCoverage enables epoch-based coverage convergence: per-endpoint
@@ -112,7 +112,7 @@ type Config struct {
 	// set, so class tasks can actually close and the scan reaches a clean
 	// terminal state instead of chasing a receding bar forever. No coverage is
 	// dropped — every discovered endpoint is folded into a later epoch and
-	// tested before finish. XALGORIX_EPOCH_COVERAGE, default false (off).
+	// tested before finish. XALGORIX_EPOCH_COVERAGE, default true (on).
 	EpochCoverage bool
 
 	// ConvergeReconcile closes out class-less exploratory plan tasks once every
@@ -122,7 +122,7 @@ type Config struct {
 	// (taskCoverageComplete) can never close them — left open they hold a scan in
 	// an unbounded churn at 100% systematic coverage. No measured coverage is
 	// dropped: the full matrix is already satisfied before anything closes.
-	// XALGORIX_CONVERGE_RECONCILE, default false (off).
+	// XALGORIX_CONVERGE_RECONCILE, default true (on).
 	ConvergeReconcile bool
 
 	// EndpointHygiene keeps the endpoint accounting (DiscoveredEndpoints,
@@ -144,7 +144,7 @@ type Config struct {
 	// structured methodology is done, per-route coverage clears a threshold, and
 	// no new finding appears for a sustained tail, the remaining per-endpoint
 	// class tasks close as coverage-sufficient with the residual (route,class)
-	// pairs recorded in the report. XALGORIX_CONVERGE_FINISH, default false (off).
+	// pairs recorded in the report. XALGORIX_CONVERGE_FINISH, default true (on).
 	ConvergeFinish bool
 
 	// ConvergeFinishIdle is the no-new-finding tail (iterations) for the
@@ -526,11 +526,11 @@ func load() *Config {
 		LeanToolSchema:           envOrBool("XALGORIX_LEAN_TOOL_SCHEMA", false),
 		AdvancePastStuckTasks:    envOrBool("XALGORIX_ADVANCE_PAST_STUCK", false),
 		MaxStuckAdvances:         envOrInt("XALGORIX_MAX_STUCK_ADVANCES", 3),
-		BoundedContext:           envOrBool("XALGORIX_BOUNDED_CONTEXT", false),
-		EpochCoverage:            envOrBool("XALGORIX_EPOCH_COVERAGE", false),
-		ConvergeReconcile:        envOrBool("XALGORIX_CONVERGE_RECONCILE", false),
+		BoundedContext:           envOrBool("XALGORIX_BOUNDED_CONTEXT", true),
+		EpochCoverage:            envOrBool("XALGORIX_EPOCH_COVERAGE", true),
+		ConvergeReconcile:        envOrBool("XALGORIX_CONVERGE_RECONCILE", true),
 		EndpointHygiene:          envOrBool("XALGORIX_ENDPOINT_HYGIENE", false),
-		ConvergeFinish:           envOrBool("XALGORIX_CONVERGE_FINISH", false),
+		ConvergeFinish:           envOrBool("XALGORIX_CONVERGE_FINISH", true),
 		ConvergeFinishIdle:       envOrInt("XALGORIX_CONVERGE_FINISH_IDLE", 500),
 		ConvergeFinishLeadWindow: envOrInt("XALGORIX_CONVERGE_FINISH_LEAD_WINDOW", 100),
 		ToolArchiveMinBytes:      envOrInt("XALGORIX_TOOL_ARCHIVE_MIN_BYTES", 1500),

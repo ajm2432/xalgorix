@@ -2092,6 +2092,18 @@ func reportVulnClass(title, description, cwe string) string {
 	case strings.Contains(lower, "xss") || strings.Contains(lower, "cross-site script") ||
 		strings.Contains(lower, "cross site script") || strings.Contains(c, "79"):
 		return "xss"
+	// Auth-enforcement bypass is kept distinct from idor/bola so verify_authbypass
+	// proof binds to the right class. Keyed narrowly on explicit bypass phrasing
+	// and the authentication-bypass CWEs (287 Improper Authentication, 288 Auth
+	// Bypass Using an Alternate Path, 425 Forced Browsing) so it never steals an
+	// object-level/function-level access-control (idor) finding, which keeps its
+	// CWE-639/862/863/285/284 mapping below. Checked BEFORE idor because a bypass
+	// write-up may also use the words "broken access control".
+	case strings.Contains(lower, "auth bypass") || strings.Contains(lower, "authentication bypass") ||
+		strings.Contains(lower, "authorization bypass") || strings.Contains(lower, "auth enforcement bypass") ||
+		strings.Contains(lower, "authentication enforcement bypass") || strings.Contains(lower, "forced browsing") ||
+		strings.Contains(c, "287") || strings.Contains(c, "288") || strings.Contains(c, "425"):
+		return "auth-bypass"
 	case strings.Contains(lower, "idor") || strings.Contains(lower, "insecure direct object") ||
 		strings.Contains(lower, "bola") || strings.Contains(lower, "broken object level") ||
 		strings.Contains(lower, "bfla") || strings.Contains(lower, "broken function level") ||
@@ -2255,6 +2267,9 @@ func canonicalVerifierClass(class string) string {
 		return "lfi"
 	case strings.Contains(c, "ssrf"):
 		return "ssrf"
+	case strings.Contains(c, "auth-bypass"), strings.Contains(c, "authentication-bypass"),
+		strings.Contains(c, "auth-enforcement-bypass"), strings.Contains(c, "forced-browsing"):
+		return "auth-bypass"
 	default:
 		return c
 	}
@@ -3202,13 +3217,19 @@ func checkFalsePositive(title, description, severity, proof string) string {
 //	MySQL             → "you have an error in your sql", "sql syntax", "warning: mysql"
 //	generic JDBC/ODBC → "sqlstate"
 //	Oracle            → "ora-0"
-//	Postgres          → "psqlexception", "quoted string not properly terminated"
+//	Postgres          → "psqlexception", "quoted string not properly terminated",
+//	                    "syntax error at or near", "unterminated quoted string",
+//	                    "invalid input syntax for"
 //	SQLite            → "sqlite3::"
-//	MSSQL             → "unclosed quotation mark after the character string"
+//	MSSQL             → "unclosed quotation mark after the character string",
+//	                    "incorrect syntax near", "conversion failed when converting",
+//	                    "microsoft ole db provider for sql server",
+//	                    "odbc sql server driver", "system.data.sqlclient.sqlexception"
 //
 // A benign web response does not emit these by accident, so a response that
 // contains one after a quote injection proves the input reaches a SQL query
-// unsanitized. Defined once here as the single source of truth: the concrete-
+// unsanitized. Each string is engine-specific enough that a normal page does not
+// carry it. Defined once here as the single source of truth: the concrete-
 // impact indicators below embed it, and the agent's verify_sqli tool matches on
 // it via LooksLikeSQLError so the detector and the reporting gate never drift.
 var dbmsErrorSignatures = []string{
@@ -3216,6 +3237,12 @@ var dbmsErrorSignatures = []string{
 	"psqlexception", "sqlite3::", "unclosed quotation mark after the character string",
 	"sqlite3.operationalerror:", "sqlite3.programmingerror:", "sqlite_error:",
 	"quoted string not properly terminated", "warning: mysql",
+	// PostgreSQL
+	"syntax error at or near", "unterminated quoted string", "invalid input syntax for",
+	// MSSQL / SQL Server
+	"incorrect syntax near", "conversion failed when converting",
+	"microsoft ole db provider for sql server", "odbc sql server driver",
+	"system.data.sqlclient.sqlexception",
 }
 
 // LooksLikeSQLError reports whether text contains a DBMS error signature (see
