@@ -780,6 +780,15 @@ func ApplyProcessLimitsWithLimit(cmd *exec.Cmd, memoryLimited bool, memLimitByte
 	setProcessLimits(cmd, memoryLimited, memLimitBytes)
 }
 
+// IsolateCommand makes cmd run inside the scan's own PID namespace, as terminal
+// commands do; python_action uses it. Call it after cmd.Path, cmd.Args and
+// cmd.Dir are final and before Start. memLimitBytes is the address-space limit
+// the command should apply to itself (0 = none). It returns false and leaves
+// cmd untouched when isolation is off or unavailable.
+func IsolateCommand(contextID string, cmd *exec.Cmd, memLimitBytes int64) bool {
+	return isolateCommand(contextID, cmd, memLimitBytes)
+}
+
 // ApplyProcessLimitsToPID is the PID-based companion to
 // ApplyProcessLimitsWithLimit. It is intended for tools that spawn their
 // child process outside of os/exec (e.g. go-rod's Launcher, which manages
@@ -1010,9 +1019,12 @@ func GetWorkDirForContext(contextID string) string {
 	return s.workDir
 }
 
-// CleanupContext removes the terminal store for a deactivated context.
+// CleanupContext removes the terminal store for a deactivated context and ends
+// the scan's process namespace, which kills anything the scan left running in
+// the background.
 func CleanupContext(contextID string) {
 	KillAllProcessesForContext(contextID)
+	releaseScanNamespace(contextID)
 	termStoresMu.Lock()
 	defer termStoresMu.Unlock()
 	delete(termStores, contextID)
@@ -1108,7 +1120,7 @@ var packageMap = map[string]string{
 	"unfurl":     "unfurl",
 	"gron":       "gron",
 	"httprobe":   "httprobe",
-	// Python tools — routed to pipx/pip via pipxTools.
+	// Python tools — routed to pipx/pip via pipxInstallSpecs.
 	"semgrep":    "semgrep",
 	"bandit":     "bandit",
 	"git-dumper": "git-dumper",
@@ -1117,6 +1129,20 @@ var packageMap = map[string]string{
 	// Distro packages (apt). gh needs GitHub's apt repo (added in the Dockerfile).
 	"dirsearch": "dirsearch",
 	"gh":        "gh",
+}
+
+// pipxInstallSpecs maps a command to what the opt-in auto-installer hands to
+// `pipx install` / `pip3 install`. A bare name is resolved on PyPI, so it must be
+// a name that project actually publishes there; tools that are not published
+// under their command name install from the upstream repository instead.
+var pipxInstallSpecs = map[string]string{
+	"arjun":       "arjun",
+	"paramspider": "git+https://github.com/devanshbatham/paramspider.git",
+	"scrapling":   "scrapling",
+	"uro":         "uro",
+	"semgrep":     "semgrep",
+	"bandit":      "bandit",
+	"git-dumper":  "git-dumper",
 }
 
 // decode decodes a base64 string
@@ -1204,6 +1230,10 @@ func executeCommandWithContextID(contextID string, args map[string]string) (tool
 	// Block destructive commands
 	if reason := isBlockedCommand(command); reason != "" {
 		return tools.Result{Output: fmt.Sprintf("[BLOCKED] Destructive command rejected: %s. Xalgorix is read-only — it tests for vulnerabilities without causing damage.", reason)}, nil
+	}
+	// Block commands aimed at processes or services outside this scan.
+	if reason := processGuardReason(command, processIsolationAvailable()); reason != "" {
+		return tools.Result{Output: fmt.Sprintf("[BLOCKED] Command rejected: %s. Scan commands may only act on processes this scan started. To stop one of your own background processes, kill it by PID or with pkill -f <its command line>.", reason)}, nil
 	}
 
 	// Pre-check: install missing tools BEFORE running the command.
@@ -1612,6 +1642,10 @@ func runShellInternal(contextID string, command string) (string, int) {
 		return os.ErrProcessDone
 	}
 
+	// Run inside the scan's own PID namespace, so ps and kill reach only this
+	// scan's processes. A no-op when isolation is unavailable.
+	isolateCommand(contextID, cmd, memLimitBytes)
+
 	// Use pipes for real-time output streaming
 	stdoutPipe, err := cmd.StdoutPipe()
 	if err != nil {
@@ -1861,17 +1895,6 @@ func installPackage(pkg string) string {
 		)
 	}
 
-	// Special handling for pipx-installed tools
-	pipxTools := map[string]string{
-		"arjun":       "arjun",
-		"paramspider": "paramspider",
-		"scrapling":   "scrapling",
-		"uro":         "uro",
-		"semgrep":     "semgrep",
-		"bandit":      "bandit",
-		"git-dumper":  "git-dumper",
-	}
-
 	// Special handling for Cargo (Rust) tools
 	cargoTools := map[string]string{
 		"feroxbuster": "feroxbuster",
@@ -1925,7 +1948,7 @@ func installPackage(pkg string) string {
 	}
 
 	// pipx-installed tools (Python)
-	if pipxPkg, ok := pipxTools[pkg]; ok {
+	if pipxPkg, ok := pipxInstallSpecs[pkg]; ok {
 		installCmd := fmt.Sprintf("pipx install %s 2>&1 || pip3 install %s 2>&1", pipxPkg, pipxPkg)
 		ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 		defer cancel()
@@ -2107,10 +2130,14 @@ var blockedPatterns = []struct {
 	{"os.remove", "file deletion"},
 	// Noisy / false-positive-heavy tools
 	{"nikto", "nikto is blocked — too many false positives. Use nuclei or manual testing instead"},
-	// The scanner's own credential file is never part of testing a target.
+	// The scanner's own credential files are never part of testing a target.
 	// Best-effort, like the rest of this list (see the boundary note below);
-	// the environment scrub in commandEnv is the matching defense for env vars.
-	{".xalgorix.env", "access to the scanner credential file is not permitted"},
+	// the environment scrub in commandEnv is the matching defense for env vars
+	// and the sandbox deny-list covers the file tools. "xalgorix.env" (no
+	// leading dot) also matches /etc/xalgorix.env.
+	{"xalgorix.env", "access to the scanner credential file is not permitted"},
+	{"llm_keys.json", "access to the scanner credential file is not permitted"},
+	{"auth-profiles.json", "access to the scanner credential file is not permitted"},
 }
 
 // isBlockedCommand checks if a command matches any blocked pattern.

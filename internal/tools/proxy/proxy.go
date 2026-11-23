@@ -52,7 +52,9 @@ func Register(r *tools.Registry) {
 			{Name: "headers", Description: "Request headers as JSON object", Required: false},
 			{Name: "body", Description: "Request body", Required: false},
 		},
-		Execute: sendRequest,
+		Execute: func(args map[string]string) (tools.Result, error) {
+			return sendRequestGuarded(r.RequestGuard(), r.DialGuard(), args)
+		},
 	})
 
 	r.Register(&tools.Tool{
@@ -67,8 +69,11 @@ func Register(r *tools.Registry) {
 }
 
 // httpClient returns the configured client. Proxy-required mode never falls
-// back to a direct connection when initialization failed.
-func httpClient() (*http.Client, error) {
+// back to a direct connection when initialization failed. dialGuard, when
+// non-nil, checks every connection of the direct client (see
+// tools.GuardDials); the proxy pool's shared client is left as it is, since
+// the proxy resolves and connects to the destination.
+func httpClient(dialGuard tools.DialGuard) (*http.Client, error) {
 	cfg := config.Get()
 	if cfg.ProxyRequired && !proxy.Required() {
 		return nil, fmt.Errorf("proxy-required mode is not initialized")
@@ -77,10 +82,30 @@ func httpClient() (*http.Client, error) {
 	if proxy.Required() {
 		return proxy.GetClient()
 	}
-	if cfg.UseProxy {
+	if viaProxyPool(cfg) {
 		return proxy.GetClient()
 	}
-	return proxy.NewDirectClient(cfg.TLSSkipVerify), nil
+	// Direct. This includes UseProxy set while the proxy manager is off (no
+	// proxy configured, or the setting was changed without a restart): the
+	// manager would hand back its own unguarded direct client.
+	client := proxy.NewDirectClient(cfg.TLSSkipVerify)
+	tr, ok := client.Transport.(*http.Transport)
+	if !ok {
+		if dialGuard != nil {
+			return nil, fmt.Errorf("direct client transport cannot be guarded")
+		}
+		return client, nil
+	}
+	// NewDirectClient's transport is private to this call.
+	if err := tools.GuardDials(tr, dialGuard); err != nil {
+		return nil, err
+	}
+	return client, nil
+}
+
+// viaProxyPool reports whether send_request routes through the proxy pool.
+func viaProxyPool(cfg *config.Config) bool {
+	return proxy.Required() || (cfg.UseProxy && proxy.Enabled())
 }
 
 func parseHeaders(headersJSON string) (map[string]string, error) {
@@ -111,6 +136,13 @@ func clampRequestCount(raw string) int {
 }
 
 func sendRequest(args map[string]string) (tools.Result, error) {
+	return sendRequestGuarded(nil, nil, args)
+}
+
+// sendRequestGuarded runs one send_request call. guard, when non-nil, is
+// applied to every redirect hop before it is followed; dialGuard, when
+// non-nil, to every direct connection.
+func sendRequestGuarded(guard tools.RequestGuard, dialGuard tools.DialGuard, args map[string]string) (tools.Result, error) {
 	targetURL := args["url"]
 	method := strings.ToUpper(args["method"])
 
@@ -138,9 +170,16 @@ func sendRequest(args map[string]string) (tools.Result, error) {
 		}
 	}
 
-	client, err := httpClient()
+	shared, err := httpClient(dialGuard)
 	if err != nil {
 		return tools.Result{}, err
+	}
+	// The proxy pool's client is shared; guard a per-request copy. Only a
+	// client on the default (follow) redirect policy needs the hop check.
+	client := *shared
+	refusedHop := func() string { return "" }
+	if client.CheckRedirect == nil {
+		refusedHop = tools.GuardRedirects(&client, guard)
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -154,7 +193,10 @@ func sendRequest(args map[string]string) (tools.Result, error) {
 	}
 
 	var b strings.Builder
-	viaProxy := proxy.Required() || (config.Get().UseProxy && proxy.Enabled())
+	if note := refusedHop(); note != "" {
+		b.WriteString(note + "\n\n")
+	}
+	viaProxy := viaProxyPool(config.Get())
 	if viaProxy {
 		b.WriteString("[via proxy pool]\n")
 	} else {

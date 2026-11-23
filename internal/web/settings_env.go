@@ -144,8 +144,8 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_CONTEXT_COMPACT_RATIO", Label: "Context compaction ratio", Category: "LLM", Description: "Fraction of the context window at which to auto-compact (0.5–0.9). Default 0.75 = compact at ~75% full. Compacting earlier discards useful working context and hurts output quality; going higher risks hitting the provider's hard limit first.", DefaultValue: "0.75", InputType: "number"},
 		{Key: "XALGORIX_CONTEXT_COMPACT_TOKENS", Label: "Context compaction budget (tokens, override)", Category: "LLM", Description: "Optional ABSOLUTE override for the compaction trigger. Leave at -1 (auto) to derive the trigger from the context window × ratio above. Set a positive token count to force a fixed budget instead. 0 disables auto-compaction. Default -1 (auto).", DefaultValue: "-1", InputType: "number"},
 		{Key: "XALGORIX_MEMORY_COMPRESSOR_TIMEOUT", Label: "Memory compressor timeout", Category: "LLM", Description: "Timeout in seconds for context compression.", DefaultValue: "30", InputType: "number"},
-		{Key: "XALGORIX_BOUNDED_CONTEXT", Label: "Bounded working context (token saver)", Category: "LLM", Description: "Archive the complete raw output of every tool result to disk and replace tool-result messages older than the active window below with compact retrieval stubs. The model fetches the byte-identical original via read_tool_output when needed — no information is lost, aged raw output just stops being resent on every iteration. Measured fleet impact: 40-60% input-token reduction. Applies to NEW scans.", DefaultValue: "false", InputType: "boolean"},
-		{Key: "XALGORIX_EPOCH_COVERAGE", Label: "Epoch-based coverage convergence", Category: "Runtime", Description: "Measure per-endpoint coverage completion against a frozen surface snapshot that advances in bounded epochs, instead of the live-growing discovered set. On large or still-growing attack surfaces this lets coverage tasks actually close so the scan reaches a clean terminal state instead of chasing a receding bar until a watchdog. No coverage is dropped: every discovered endpoint is folded into a later epoch and tested before finish. Applies to NEW scans.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_BOUNDED_CONTEXT", Label: "Bounded working context (token saver)", Category: "LLM", Description: "Archive the complete raw output of every tool result to disk and replace tool-result messages older than the active window below with compact retrieval stubs. The model fetches the byte-identical original via read_tool_output when needed — no information is lost, aged raw output just stops being resent on every iteration. Measured fleet impact: 40-60% input-token reduction. Applies to NEW scans.", DefaultValue: "true", InputType: "boolean"},
+		{Key: "XALGORIX_EPOCH_COVERAGE", Label: "Epoch-based coverage convergence", Category: "Runtime", Description: "Measure per-endpoint coverage completion against a frozen surface snapshot that advances in bounded epochs, instead of the live-growing discovered set. On large or still-growing attack surfaces this lets coverage tasks actually close so the scan reaches a clean terminal state instead of chasing a receding bar until a watchdog. No coverage is dropped: every discovered endpoint is folded into a later epoch and tested before finish. Applies to NEW scans.", DefaultValue: "true", InputType: "boolean"},
 		{Key: "XALGORIX_TOOL_ARCHIVE_ACTIVE_WINDOW", Label: "Bounded context: active window", Category: "LLM", Description: "How many recent tool-result messages stay verbatim in the conversation before older ones become retrieval stubs (used by bounded working context above).", DefaultValue: "8", InputType: "number"},
 		{Key: "XALGORIX_TOOL_ARCHIVE_MIN_BYTES", Label: "Bounded context: archive threshold (bytes)", Category: "LLM", Description: "Minimum raw-output size before a tool result is archived/stubbed. Smaller results stay in-context verbatim.", DefaultValue: "1500", InputType: "number"},
 		{Key: "XALGORIX_ROLE_SCOPED_TOOLS", Label: "Role-scoped specialist tools (token saver)", Category: "LLM", Description: "Withhold documentation of role-foreign tools (e.g. browser tools from the authz specialist) from delegated specialists' prompts. Hidden tools remain callable and are listed in a compact index, so the reachable tool set is unchanged. Applies to NEW scans.", DefaultValue: "false", InputType: "boolean"},
@@ -199,6 +199,8 @@ func allEnvSettingDefinitions() []envSettingDefinition {
 		{Key: "XALGORIX_BROWSER_PATH", Label: "Browser path", Category: "Runtime", Description: "Custom Chrome/Chromium executable path.", InputType: "path"},
 		{Key: "XALGORIX_ALLOW_AUTO_INSTALL", Label: "Allow auto-install", Category: "Runtime", Description: "Permit the agent to auto-install missing packages.", DefaultValue: autoInstallDefault, InputType: "boolean"},
 		{Key: "XALGORIX_AUTO_INSTALL_SUDO", Label: "Allow sudo auto-install", Category: "Runtime", Description: "Permit sudo-prefixed auto-installs.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_PHASE_PLAYBOOKS", Label: "Phase playbooks", Category: "Runtime", Description: "Send each large methodology phase to the model only while it is in use (an active task, a class being tested, or next in the plan) instead of on every call. Cuts tokens per call; A/B-test findings before relying on it.", DefaultValue: "false", InputType: "boolean"},
+		{Key: "XALGORIX_PROCESS_ISOLATION", Label: "Process isolation", Category: "Runtime", Description: "Run each scan's commands in their own PID namespace, so they can only see and signal that scan's processes (Linux, needs root).", DefaultValue: "true", InputType: "boolean"},
 		{Key: "XALGORIX_ALLOW_ABSOLUTE_FILEEDIT", Label: "Allow absolute file edits", Category: "Runtime", Description: "Allow file-edit tooling to write absolute paths.", DefaultValue: "false", InputType: "boolean"},
 
 		{Key: "XALGORIX_USERNAME", Label: "Dashboard username", Category: "Security", Description: "Dashboard login username.", InputType: "text", RequiresRestart: true},
@@ -811,9 +813,9 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 		case "XALGORIX_CONTEXT_COMPACT_RATIO":
 			s.cfg.ContextCompactRatio = parseFloatSetting(value, 0.75)
 		case "XALGORIX_BOUNDED_CONTEXT":
-			s.cfg.BoundedContext = parseBoolSetting(value, false)
+			s.cfg.BoundedContext = parseBoolSetting(value, true)
 		case "XALGORIX_EPOCH_COVERAGE":
-			s.cfg.EpochCoverage = parseBoolSetting(value, false)
+			s.cfg.EpochCoverage = parseBoolSetting(value, true)
 		case "XALGORIX_TOOL_ARCHIVE_MIN_BYTES":
 			s.cfg.ToolArchiveMinBytes = parseIntSetting(value, 1500)
 		case "XALGORIX_TOOL_ARCHIVE_ACTIVE_WINDOW":
@@ -911,6 +913,14 @@ func (s *Server) applyEnvironmentToRuntimeConfig(values map[string]string) {
 			s.cfg.AllowAutoInstall = parseBoolSetting(value, os.Getuid() == 0)
 		case "XALGORIX_AUTO_INSTALL_SUDO":
 			s.cfg.AllowAutoInstallSudo = parseBoolSetting(value, false)
+		case "XALGORIX_PHASE_PLAYBOOKS":
+			s.cfg.PhasePlaybooks = parseBoolSetting(value, false)
+		case "XALGORIX_DISABLE_AUTO_DELEGATE":
+			s.cfg.DisableAutoDelegate = parseBoolSetting(value, false)
+		case "XALGORIX_CHECKLIST":
+			s.cfg.Checklist = config.NormalizeChecklist(value)
+		case "XALGORIX_PROCESS_ISOLATION":
+			s.cfg.ProcessIsolation = parseBoolSetting(value, true)
 		case "XALGORIX_USE_PROXY":
 			s.cfg.UseProxy = parseBoolSetting(value, false)
 		case "XALGORIX_PROXY_REQUIRED":
@@ -1052,6 +1062,10 @@ func (s *Server) envSettingValue(key string) string {
 		return strconv.FormatBool(s.cfg.AllowAutoInstall)
 	case "XALGORIX_AUTO_INSTALL_SUDO":
 		return strconv.FormatBool(s.cfg.AllowAutoInstallSudo)
+	case "XALGORIX_PHASE_PLAYBOOKS":
+		return strconv.FormatBool(s.cfg.PhasePlaybooks)
+	case "XALGORIX_PROCESS_ISOLATION":
+		return strconv.FormatBool(s.cfg.ProcessIsolation)
 	case "XALGORIX_USE_PROXY":
 		return strconv.FormatBool(s.cfg.UseProxy)
 	case "XALGORIX_PROXY_REQUIRED":

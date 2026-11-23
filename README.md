@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/banner.png?v=4.6.133" alt="Xalgorix — AI Autonomous Penetration Testing Platform" width="860" />
+<img src="assets/banner.png?v=4.6.133" alt="Xalgorix — open-source autonomous AI penetration testing agent with exploit-verified findings" width="860" />
 
 <br />
 
@@ -17,7 +17,7 @@
 <h1 align="center">Xalgorix — Open-source AI pentester that <em>proves</em> vulnerabilities</h1>
 
 <p align="center">
-  <strong>Most scanners detect. Xalgorix proves.</strong> An autonomous LLM agent works a full pentest methodology, then an <strong>independent verifier re-exploits every finding</strong> before it's reported — so you get proof, not a pile of maybes to triage. Self-hosted, private, and bring-your-own-LLM. Built in Go + TypeScript.
+  <strong>Most scanners detect. Xalgorix proves.</strong> An autonomous AI penetration testing agent works a full 22-phase pentest methodology against your web apps and APIs, then an <strong>independent verifier re-exploits every finding</strong> before it's reported — so you get proof, not a pile of maybes to triage. Self-hosted, private, and bring-your-own-LLM (or fully local with Ollama). Built in Go + TypeScript.
 </p>
 
 <p align="center">
@@ -26,6 +26,7 @@
   <a href="#-features">✨ Features</a> ·
   <a href="#-use-cases">🎯 Use Cases</a> ·
   <a href="#self-host-or-cloud">☁️ Self-host or Cloud</a> ·
+  <a href="#-faq">❓ FAQ</a> ·
   <a href="https://docs.xalgorix.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_docs&utm_content=hero_nav">📖 Docs</a> ·
   <a href="https://github.com/xalgorix/xalgorix/discussions">💬 Discussions</a>
 </p>
@@ -45,7 +46,7 @@
 
 | Overview dashboard                                      | Scan detail                                      | Findings                                      |
 | ------------------------------------------------------- | ------------------------------------------------ | --------------------------------------------- |
-| ![Xalgorix overview dashboard](assets/screenshot-1.png) | ![Xalgorix scan detail](assets/screenshot-2.png) | ![Xalgorix findings](assets/screenshot-3.png) |
+| ![Xalgorix self-hosted AI pentesting dashboard: active scans, recent findings and system health](assets/screenshot-1.png) | ![Xalgorix scan detail: 22-phase methodology progress, risk overview and findings](assets/screenshot-2.png) | ![Xalgorix findings: SQL injection, SSRF and RCE ranked by severity with CVSS scores](assets/screenshot-3.png) |
 
 **☁️ Xalgorix Cloud dashboard** — the managed version at [www.xalgorix.com](https://www.xalgorix.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=screenshot_caption)
 
@@ -53,26 +54,17 @@
 
 ---
 
----
-
 ## 🤝 Sponsors
 
-Xalgorix is supported by these proxy-infrastructure partners — handy for checking how your own apps behave across regions. Both speak **HTTP(S) and SOCKS5**, the protocols Xalgorix uses.
+Xalgorix is supported by proxy-infrastructure partners — handy for checking how your own apps behave across regions. Proxy-Seller speaks **HTTP(S) and SOCKS5**, the protocols Xalgorix uses.
 
 <table>
   <tr>
-    <td align="center" valign="middle" width="50%">
-      <a href="https://www.swiftproxy.net/?ref=xalgorix"><img src="assets/swiftproxy_xalgorix.webp" alt="Swiftproxy" height="132" /></a>
-    </td>
-    <td align="center" valign="middle" width="50%">
+    <td align="center" valign="middle">
       <a href="https://proxy-seller.com/?partner=11571212D46044C9"><img src="assets/proxyseller_xalgorix.jpg" alt="Proxy-Seller" height="132" /></a>
     </td>
   </tr>
   <tr>
-    <td align="center" valign="top">
-      <b><a href="https://www.swiftproxy.net/?ref=xalgorix">Swiftproxy</a></b><br/>
-      <sub>Residential proxies from $0.70/GB · location targeting · sticky sessions<br/>Xalgorix users get <b>10% off</b> with <code>PROXY90</code></sub>
-    </td>
     <td align="center" valign="top">
       <b><a href="https://proxy-seller.com/?partner=11571212D46044C9">Proxy-Seller</a></b><br/>
       <sub>47M+ residential IPs · 220+ locations · residential, mobile, ISP &amp; datacenter<br/>Xalgorix users get <b>15% off</b> with <code>XALGORIX</code></sub>
@@ -175,6 +167,7 @@ Need merge gating or a full exploit-verified pentest of the running app? Start a
 | 📥 [Installation](#-installation) | 📂 [Scan Your Code](#-scan-your-code-no-target-needed) | 🚨 [Safety Notes](#-safety-notes) |
 | 🧭 [Methodology](#-methodology) | 📄 [Reports](#-reports) | 📜 [License](#-license) |
 | 🔧 [Settings](#-settings) | 🔗 [Links](#-links) | 🤝 [Sponsors](#-sponsors) |
+| ❓ [FAQ](#-faq) | | |
 
 ## 🔎 Overview
 
@@ -231,7 +224,7 @@ Xalgorix is free and open source — self-host it forever, no strings attached. 
 
 <div align="center">
 
-[**☁️ Start a Cloud scan →**](https://www.xalgorix.com/signup?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_signup) &nbsp;·&nbsp; [**💳 See pricing**](https://www.xalgorix.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_pricing) &nbsp;·&nbsp; [**⚖️ Full comparison & cost calculator**](https://www.xalgorix.com/hosted-vs-self-hosted?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_compare)
+[**☁️ Start a Cloud scan →**](https://www.xalgorix.com/signup?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_signup) &nbsp;·&nbsp; [**💳 See pricing**](https://www.xalgorix.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_pricing) &nbsp;·&nbsp; [**⚖️ Full comparison & cost calculator**](https://www.xalgorix.com/hosted-vs-self-hosted?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_compare) &nbsp;·&nbsp; [**🔎 See a real sample report**](https://www.xalgorix.com/sample?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=cta_sample)
 
 </div>
 
@@ -769,6 +762,8 @@ Some settings require a restart because they affect process startup or server bi
 | `XALGORIX_BROWSER_PATH`        | auto         | Custom Chrome/Chromium executable path.            |
 | `XALGORIX_ALLOW_AUTO_INSTALL`  | root only    | Permit automatic package installation.             |
 | `XALGORIX_AUTO_INSTALL_SUDO`   | `false`      | Permit sudo-prefixed auto-installs.                |
+| `XALGORIX_PROCESS_ISOLATION`   | `true`       | Run each scan's commands in their own PID namespace (Linux, root). |
+| `XALGORIX_PHASE_PLAYBOOKS`     | `false`      | Send each large methodology phase only while it is in use (shorter prompt per call). |
 
 ## 🔤 Provider Prefixes
 
@@ -874,6 +869,40 @@ In the Docker image and the Helm chart, this directory is the `/data` volume (`X
 - Exposing the dashboard externally requires authentication.
 - Auto-install is disabled by default for non-root users and should be enabled only when you trust the environment.
 
+## ❓ FAQ
+
+### What is Xalgorix?
+
+Xalgorix is a free, open-source AI penetration testing tool. An autonomous LLM agent runs a 22-phase pentest methodology against web applications and APIs (reconnaissance, injection, SSRF, IDOR, auth bypass, business logic and more), then a separate verifier re-exploits every candidate finding before it is reported. You get exploit-verified vulnerabilities with CVSS scores, proof-of-concept evidence and remediation in a branded PDF report.
+
+### Is Xalgorix free?
+
+Yes. The engine is open source under the Apache 2.0 license and you can self-host it with no limits. You only pay your own LLM provider for the tokens a scan uses, or nothing at all with a local model through Ollama. [Xalgorix Cloud](#self-host-or-cloud) is an optional hosted version for people who would rather not run it themselves.
+
+### Which LLMs does Xalgorix support?
+
+OpenAI, Anthropic, Google Gemini, DeepSeek, Groq and other hosted providers, local models through Ollama, and any OpenAI-compatible endpoint, including [LiteLLM](#-litellm--openai-compatible-gateways-github-copilot-claude-opus-codex-openrouter-azure-local-models), OpenRouter and Azure OpenAI. See [Provider Prefixes](#-provider-prefixes) for the full list. A current frontier model with strong reasoning and reliable tool calling gives the best results on long autonomous scans.
+
+### How is Xalgorix different from Nuclei or OWASP ZAP?
+
+Nuclei matches known templates and ZAP crawls an application and applies active scan rules. Xalgorix is an AI agent that reasons about authentication flows, access control and business logic, chains steps together, and then proves each finding by re-exploiting it. The tools complement each other: the Docker image ships nuclei, httpx, ffuf, sqlmap and other scanners that the agent drives itself. See [How it compares](#-how-it-compares).
+
+### Does Xalgorix send my data anywhere?
+
+Nothing is sent to Xalgorix. Scan context goes only to the LLM provider you configure, or stays on your machine with a local model. Blind-vulnerability (out-of-band) callbacks use public Interactsh servers unless you set `XALGORIX_INTERACTSH_SERVER` to your own, so with a local model and your own callback server, nothing leaves your network except traffic to the target.
+
+### Can I scan source code without a running app?
+
+Yes. `xalgorix --source ./my-app --code-scan review` audits the code and traces user input to dangerous sinks with no live target. `--code-scan provision` builds and runs the app locally, then pentests the running instance. See [Scan Your Code](#-scan-your-code-no-target-needed).
+
+### Can I run Xalgorix in CI or on a schedule?
+
+Yes. Run it as a service with `xalgorix --start`, schedule scans from the dashboard, and send findings to Discord or Telegram. Automation can call the [REST API](#-api-summary) with a machine token (`XALGORIX_API_TOKEN`). For a security review on every pull request, install the free [Xalgorix GitHub App](https://github.com/apps/xalgorix).
+
+### Is it legal to use Xalgorix?
+
+Only against systems you own or have explicit permission to test. Xalgorix runs real attacks, so treat it like any other offensive-security tool and follow your engagement's scope and rules. See [Safety Notes](#-safety-notes).
+
 ## 📜 License
 
 Xalgorix is released under the Apache License 2.0. See [LICENSE](LICENSE).
@@ -882,7 +911,7 @@ Xalgorix is released under the Apache License 2.0. See [LICENSE](LICENSE).
 
 | Resource      | Link                                                                             |
 | ------------- | -------------------------------------------------------------------------------- |
-| ☁️ Xalgorix Cloud | [www.xalgorix.com](https://www.xalgorix.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=links_table) · [pricing](https://www.xalgorix.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=links_table_pricing) |
+| ☁️ Xalgorix Cloud | [www.xalgorix.com](https://www.xalgorix.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=links_table) · [pricing](https://www.xalgorix.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=links_table_pricing) · [sample report](https://www.xalgorix.com/sample?utm_source=github&utm_medium=readme&utm_campaign=oss_to_cloud&utm_content=links_table_sample) |
 | 🤖 GitHub App     | [Free security review on every PR](https://github.com/apps/xalgorix)              |
 | 📖 Documentation | [docs.xalgorix.com](https://docs.xalgorix.com/?utm_source=github&utm_medium=readme&utm_campaign=oss_docs&utm_content=links_table)   |
 | 💬 Questions     | [GitHub Discussions](https://github.com/xalgorix/xalgorix/discussions)             |

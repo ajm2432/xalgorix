@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"time"
@@ -295,13 +296,100 @@ type scanRecordLite struct {
 	Events json.RawMessage `json:"events"`
 }
 
+// scanSummaryWalk is one walk of the data dir shared by every
+// findAllScanSummaries caller that joined it. results and panicValue are
+// written before done is closed and only read after.
+type scanSummaryWalk struct {
+	done       chan struct{}
+	results    []scanEntry
+	panicValue any
+	joiners    int // callers waiting on this walk; guarded by scanSummaryWalkMu
+}
+
 // findAllScanSummaries is the events-free, cached counterpart to findAllScans.
-// It walks the data dir (pruning artifact subtrees via walkScanDirs), parses
-// each scan.json without decoding its event log, and memoizes the result per
-// file keyed by (modtime, size). Subsequent walks only stat each scan.json and
-// re-parse the few that changed. Callers that need the event log (report
-// generation) must use findAllScans instead.
+// Callers that need the event log (report generation) must use findAllScans
+// instead.
+//
+// A walk lists every directory under the data dir, which takes seconds on a
+// busy install, and nearly every API request needs one. Running a walk per
+// request behind a single lock let requests arrive faster than walks finished:
+// the queue grew without bound and every request timed out, including ones
+// whose clients had long gone. So walks are shared. At most one runs at a time,
+// and every caller that arrives while it runs waits for the single walk queued
+// behind it. That walk starts only after the caller arrived, so the results
+// are as fresh as an unshared walk's: a scan.json created before the call is
+// always seen. (A rewrite of an existing scan.json is subject to the
+// (modtime, size) memo, as it always was.)
+//
+// Each caller receives its own slice. The records inside it are shallow copies
+// of cached values, so callers must not mutate their nested slices or maps in
+// place.
 func (s *Server) findAllScanSummaries() []scanEntry {
+	s.scanSummaryWalkMu.Lock()
+	w := s.scanSummaryWalkRunning
+	if w == nil {
+		w = &scanSummaryWalk{done: make(chan struct{})}
+		s.scanSummaryWalkRunning = w
+		s.scanSummaryWalkMu.Unlock()
+		s.runScanSummaryWalk(w)
+		if w.panicValue != nil {
+			panic(w.panicValue)
+		}
+		// Nobody joins a running walk, so these results are this caller's.
+		return w.results
+	}
+	// The running walk may have listed directories before this call, so its
+	// results can be stale. Join the walk queued behind it.
+	if s.scanSummaryWalkNext == nil {
+		s.scanSummaryWalkNext = &scanSummaryWalk{done: make(chan struct{})}
+	}
+	w = s.scanSummaryWalkNext
+	w.joiners++
+	s.scanSummaryWalkMu.Unlock()
+	<-w.done
+	if w.panicValue != nil {
+		panic(w.panicValue)
+	}
+	return append([]scanEntry(nil), w.results...)
+}
+
+// errScanSummaryWalkAborted is what waiters receive when a walk ends without
+// returning or panicking (runtime.Goexit). Handing them empty results instead
+// would read as "no scans exist".
+var errScanSummaryWalkAborted = errors.New("scan summary walk exited without completing")
+
+// runScanSummaryWalk performs walk w, publishes its results, and starts the
+// walk queued behind it, if any callers joined one. A walk that panics or
+// aborts still releases its waiters, which then panic in their own goroutines.
+func (s *Server) runScanSummaryWalk(w *scanSummaryWalk) {
+	completed := false
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("[scan] scan summary walk panicked: %v\n%s", r, debug.Stack())
+			w.panicValue = r
+		} else if !completed {
+			w.panicValue = errScanSummaryWalkAborted
+		}
+		s.scanSummaryWalkMu.Lock()
+		next := s.scanSummaryWalkNext
+		s.scanSummaryWalkNext = nil
+		s.scanSummaryWalkRunning = next
+		s.scanSummaryWalkMu.Unlock()
+		close(w.done)
+		if next != nil {
+			go s.runScanSummaryWalk(next)
+		}
+	}()
+	w.results = s.walkScanSummaries()
+	completed = true
+}
+
+// walkScanSummaries walks the data dir (pruning artifact subtrees via
+// walkScanDirs), parses each scan.json without decoding its event log, and
+// memoizes the result per file keyed by (modtime, size). Subsequent walks only
+// stat each scan.json and re-parse the few that changed. Only
+// runScanSummaryWalk calls it, so at most one walk runs at a time.
+func (s *Server) walkScanSummaries() []scanEntry {
 	var results []scanEntry
 
 	s.scanSummaryCacheMu.Lock()
@@ -342,6 +430,9 @@ func (s *Server) findAllScanSummaries() []scanEntry {
 		}
 	}
 
+	if s.scanSummaryWalkHook != nil {
+		s.scanSummaryWalkHook()
+	}
 	return results
 }
 
@@ -352,13 +443,20 @@ func (s *Server) findAllScanSummaries() []scanEntry {
 // load: findScanByID loads the whole record; the scan-detail path loads only a
 // tail of events (loadScanRecordForDetail).
 func (s *Server) resolveScanDirByID(scanID string) (string, bool) {
+	return s.resolveScanDirByIDFrom(scanID, s.findAllScanSummaries)
+}
+
+// resolveScanDirByIDFrom is resolveScanDirByID over summaries supplied by the
+// caller, so a request that needs the summaries again can reuse one walk.
+// summaries is not called for an invalid id.
+func (s *Server) resolveScanDirByIDFrom(scanID string, summaries func() []scanEntry) (string, bool) {
 	// Sanitize: prevent path traversal via ../
 	scanID = filepath.Base(scanID)
 	if scanID == "" || scanID == "." || scanID == ".." {
 		return "", false
 	}
 
-	entries := s.findAllScanSummaries()
+	entries := summaries()
 	resolveUniqueDir := func(topLevelOnly bool) (string, bool, bool) {
 		var matchedDir string
 		found := false
@@ -753,7 +851,7 @@ func isInterruptedRecoverableRecord(status, stopReason string) bool {
 		reason := strings.ToLower(strings.TrimSpace(stopReason))
 		return strings.HasPrefix(reason, "signal_") ||
 			reason == "panic_recovered" ||
-			reason == "server_restart_resuming" ||
+			reason == stopReasonRestartResuming ||
 			reason == "server_shutdown"
 	default:
 		return false
@@ -899,6 +997,38 @@ func (s *Server) attachWildcardSubScans(rec *ScanRecord) {
 	// full findAllScans() here (per parent, on every GET) was a primary
 	// driver of the JSON-decode CPU and multi-GB transient allocations.
 	s.attachWildcardSubScansFrom(rec, s.findAllScanSummaries())
+}
+
+// attachWildcardSubScansForDetail attaches sub-scans for a scan-detail
+// response, reusing the request's summaries when that is safe. Those summaries
+// were walked before rec was loaded, so they can predate it. For an unfinished
+// parent that only delays child progress by one walk. A finished parent needs
+// children at least as new as itself: a child that finished just before the
+// parent would otherwise still look unfinished and mark the parent stopped.
+// So a finished parent walks again, after it was loaded. Only a record that
+// can have children needs that: a wildcard parent, or a record that already
+// has a child in the summaries (legacy parents match children by target).
+// Any other finished record reuses the summaries.
+func (s *Server) attachWildcardSubScansForDetail(rec *ScanRecord, summaries func() []scanEntry) {
+	if rec == nil || rec.ParentTarget != "" {
+		return
+	}
+	entries := summaries()
+	if isTerminalScanStatus(rec.Status) && (isWildcardAssessmentParent(rec) || hasChildScan(rec, entries)) {
+		s.attachWildcardSubScans(rec)
+		return
+	}
+	s.attachWildcardSubScansFrom(rec, entries)
+}
+
+// hasChildScan reports whether any entry is a child of parent.
+func hasChildScan(parent *ScanRecord, entries []scanEntry) bool {
+	for i := range entries {
+		if isChildOfScan(parent, &entries[i].rec) {
+			return true
+		}
+	}
+	return false
 }
 
 // attachWildcardSubScansFrom is the same as attachWildcardSubScans but reuses
@@ -1048,6 +1178,13 @@ func (s *Server) attachWildcardSubScansFrom(rec *ScanRecord, entries []scanEntry
 		default:
 			continue
 		}
+		// The coordinator's own announcements (the auto-resume banner names
+		// the parent target and carries the parent's scan id) never describe
+		// a child host. Replaying one bound the parent to the pending child
+		// for the same host and reported it as a running sub-scan.
+		if rec.ID != "" && evt.AgentID == rec.ID {
+			continue
+		}
 		if existing := children[normalizeScanTarget(target)]; existing != nil && existing.ID != "" {
 			continue // Durable identity/lifecycle outrank replayed descriptors.
 		}
@@ -1127,7 +1264,10 @@ func (s *Server) attachWildcardSubScansFrom(rec *ScanRecord, entries []scanEntry
 	}
 	if isCompletedScanStatus(rec.Status) && (danglingActive || running > 0 || remaining > 0) {
 		rec.Status = "stopped"
-		if rec.StopReason == "" {
+		// A completed parent can still carry the restart-recovery marker from
+		// before its resume; on a stopped record it would read as "stopped,
+		// but about to resume".
+		if rec.StopReason == "" || rec.StopReason == stopReasonRestartResuming {
 			rec.StopReason = "incomplete_wildcard_subscans"
 		}
 		if rec.FinishedAt == "" {
@@ -1233,28 +1373,55 @@ func (s *Server) rebuildInstancesFromDisk() {
 		return entry.rec.ID, false
 	}
 
+	// An exact stop is recorded in the durable dispatch snapshot, not in
+	// scan.json, and the snapshot tombstones the instance ID: runMultiScan
+	// refuses any further run under it. Give records the tombstone's stop
+	// before anything reads their status, so a stopped scan is not rebuilt as
+	// paused (resumable, but refused on resume) or as an interrupted run.
+	tombstones := make(map[string]*ScanRecord)
+	for i := range entries {
+		entry := &entries[i]
+		if s.applyDispatchTombstone(&entry.rec, tombstones) {
+			s.persistStopToScanDir(entry.dir, entry.rec.Status, entry.rec.StopReason, entry.rec.FinishedAt)
+		}
+	}
+
 	// First normalize every interrupted record so wildcard parent aggregation
 	// below observes the recovered child statuses rather than stale running
 	// values captured before the restart.
 	for i := range entries {
 		entry := &entries[i]
 		s.reconcileSavedFindingUpgrades(&entry.rec, entry.dir)
-		_, resumable := instanceIdentity(entry)
+		instID, resumable := instanceIdentity(entry)
 		if !isInterruptedRecoverableRecord(entry.rec.Status, entry.rec.StopReason) {
 			continue
 		}
 		if resumable {
+			// Queued for auto-resume: pending, never stopped, so pollers that
+			// treat "stopped" as final keep waiting for the resumed run.
 			entry.rec.Status = "pending"
-			entry.rec.StopReason = "server_restart_resuming"
+			entry.rec.StopReason = stopReasonRestartResuming
 			entry.rec.FinishedAt = ""
-		} else if entry.rec.Status != "stopped" {
+			if entry.rec.ParentTarget == "" {
+				s.markDispatchSnapshotResuming(instID)
+			}
+		} else if entry.rec.Status != "stopped" || entry.rec.StopReason == stopReasonRestartResuming {
 			// Only terminalize records that were mid-flight (running/pending)
 			// and have no resume state. A signal-stopped record with no valid
 			// queue_state is already correctly "stopped"; leave its reason
-			// intact rather than rewriting it every boot.
+			// intact rather than rewriting it every boot. A stopped record
+			// that still says it is resuming (written by older versions)
+			// contradicts itself, so give it the final reason.
 			entry.rec.Status = "stopped"
-			entry.rec.StopReason = "server_restart_no_resume_state"
-			entry.rec.FinishedAt = time.Now().Format(time.RFC3339)
+			entry.rec.StopReason = stopReasonRestartNoResumeState
+			if entry.rec.FinishedAt == "" {
+				entry.rec.FinishedAt = time.Now().Format(time.RFC3339)
+			}
+			if entry.rec.ParentTarget == "" {
+				// An earlier start may have marked the exact snapshot as
+				// resuming; nothing will resume it now.
+				s.settleResumingDispatchSnapshot(instID, nil, entry.rec.Status, entry.rec.StopReason, entry.rec.FinishedAt)
+			}
 		}
 		normalizeTerminalWildcardProgress(&entry.rec)
 		s.saveScanRecordTo(&entry.rec, entry.dir)
@@ -1322,6 +1489,10 @@ func (s *Server) rebuildInstancesFromDisk() {
 			SubScanSkipped:     entry.rec.SubScanSkipped,
 			WorkStarted:        entry.rec.WorkStarted,
 			events:             append([]WSEvent(nil), entry.rec.Events...),
+			// Keep the scan dir so a paused scan without saved queue state
+			// can still resume from it after a restart, and so its folder
+			// counts as in use while it is paused.
+			scanDir: entry.dir,
 		}
 		applyRecordIntegrityLocked(inst, &entry.rec)
 		inst.wildcardAssessmentReady = entry.rec.ScanMode == "wildcard"

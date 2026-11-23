@@ -1,0 +1,68 @@
+# Registry packages that the bundled skills (internal/tools/skills/data) and
+# tools.md tell the agent or an operator to install. Checked by
+# TestInstallCommandsNameVerifiedPackages.
+#
+# The agent follows skill commands on the scanning host, so every name here
+# must be one the intended project actually publishes on that registry, with
+# releases. Before adding an entry, open the registry page and confirm the
+# owner, homepage and release history match the tool the skill means. If the
+# project does not publish there under that name, change the skill to the
+# project's upstream install method (git clone, go install, distro package)
+# instead of adding the name.
+#
+# Format: <pypi|npm|rubygems|crates> <name>
+# PyPI names are PEP 503-normalized (lowercase, runs of - _ . become -);
+# crate names are lowercase with _ written as -.
+
+pypi bandit
+pypi boto3
+pypi builtwith
+pypi cbor2
+pypi checkdmarc
+pypi checkov
+pypi corscanner
+pypi cryptography
+pypi droopescan
+pypi git-dumper
+pypi git-filter-repo
+pypi guardrails-ai
+pypi impacket
+pypi ldap3
+pypi mcp
+pypi nemoguardrails
+pypi pre-commit
+pypi presidio-analyzer
+pypi presidio-anonymizer
+pypi protobuf
+pypi prowler
+pypi pwntools
+pypi pyjwt
+pypi python-gvm
+pypi regexploit
+pypi requests
+pypi ropgadget
+pypi scoutsuite
+pypi scrapling
+pypi semgrep
+pypi sentencepiece
+pypi spacy
+pypi sqlmap
+pypi sslyze
+pypi torch
+pypi transformers
+pypi wafw00f
+pypi websockets
+pypi wfuzz
+pypi xsrfprobe
+
+npm snyk
+npm wappalyzer
+npm wscat
+
+rubygems brakeman
+rubygems evil-winrm
+rubygems wpscan
+
+crates feroxbuster
+crates findomain
+crates websocat

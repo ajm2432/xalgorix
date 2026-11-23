@@ -274,6 +274,34 @@ func validDispatchID(id string) bool {
 	return true
 }
 
+// claimPausedInstanceLocked removes inst from s.instances if it is still the
+// entry registered under its ID and still paused, and reports whether this
+// caller removed it. The caller must hold instancesMu for writing.
+// registerMultiScan claims a resumed instance in the same critical section
+// that installs its replacement. Two overlapping resume requests can both find
+// an instance paused; only the one that claims it may start the replacement.
+// Without the claim the second request removed the first one's live
+// replacement from the map (leaving a running scan nobody could stop) or, with
+// new_id, ran a second session on the same scan dir. Re-checking the status
+// here also keeps a stop that landed after the handler's paused check from
+// being undone.
+func (s *Server) claimPausedInstanceLocked(inst *ScanInstance) bool {
+	if inst == nil {
+		return false
+	}
+	if s.instances[inst.ID] != inst {
+		return false
+	}
+	inst.mu.RLock()
+	paused := inst.Status == "paused"
+	inst.mu.RUnlock()
+	if !paused {
+		return false
+	}
+	delete(s.instances, inst.ID)
+	return true
+}
+
 // reserveDispatchID serializes duplicate HTTP submissions before runMultiScan
 // registers the instance. Existing/reserved IDs are idempotent acknowledgments,
 // never permission to overwrite another live run.
@@ -418,6 +446,10 @@ type ScanRequest struct {
 	ResumeTotalTokens    int      `json:"-"`
 	ResumeToolCalls      int      `json:"-"`
 	queueOwnership       *queueOwnership
+
+	// resumeReplaces is the paused instance that a resume replaces in the
+	// same step that registers the new run (see registerMultiScan).
+	resumeReplaces *ScanInstance
 
 	// Code-scan internals, resolved server-side from CodeScan in handleScan.
 	// codeScanMode drives the agent's methodology; allowLoopbackPorts is the
@@ -845,6 +877,19 @@ type Server struct {
 	// whose file changes is re-parsed. See findAllScanSummaries.
 	scanSummaryCacheMu sync.Mutex
 	scanSummaryCache   map[string]scanSummaryCacheEntry
+	// scanSummaryWalkMu guards the shared walks behind findAllScanSummaries:
+	// the walk in progress, and the one queued behind it for callers that
+	// arrived while it ran.
+	scanSummaryWalkMu      sync.Mutex
+	scanSummaryWalkRunning *scanSummaryWalk
+	scanSummaryWalkNext    *scanSummaryWalk
+	// scanSummaryWalkHook, when set, runs at the end of every summary walk,
+	// before its results are shared. Tests use it to count and pace walks.
+	scanSummaryWalkHook func()
+	// runResumedQueueFn runs a queue that the startup auto-resume registered.
+	// nil in production (runRegisteredMultiScan runs it); tests set it to
+	// observe the registered run without starting real scan work.
+	runResumedQueueFn func(*multiScanRun, *config.Config)
 	// admissionWake is a buffered (len=1) channel used by runMultiScan's
 	// admission loop to wait fairly for a freed slot. A scan instance ending
 	// signals this channel non-blockingly in its defer cleanup, waking
@@ -1092,6 +1137,47 @@ func queueResumeEntryKey(entry queueStateEntry) string {
 		return filepath.Clean(entry.path)
 	}
 	return "legacy"
+}
+
+// queueResumeSkipReasonLocked returns why the startup auto-resume must leave a
+// saved queue alone, or "" when it may resume it. The caller holds
+// queueResumeMu.
+//
+// A queue is left alone only when something already runs or resumes it: a
+// resume launch still holding its key (from /api/queue/resume, for example),
+// a dispatch that reserved the instance ID and has not registered it yet, or
+// a registered instance under that ID other than the placeholder restart
+// recovery installed. A launch marks its key before its goroutine registers
+// the run, so in that window registerMultiScan would let a second launch of
+// the same queue through. In the other cases registerMultiScan refuses, but
+// the refused launch would still clear a launching key it shares.
+func (s *Server) queueResumeSkipReasonLocked(entry queueStateEntry) string {
+	if s.queueResumeLaunching[queueResumeEntryKey(entry)] {
+		return "a resume of this queue is already launching"
+	}
+	if entry.state == nil {
+		return ""
+	}
+	id := strings.TrimSpace(entry.state.InstanceID)
+	if id == "" {
+		return ""
+	}
+	s.dispatchMu.Lock()
+	reserved := s.dispatchReservations[id]
+	s.dispatchMu.Unlock()
+	if reserved {
+		return "a dispatch under this instance id is still starting"
+	}
+	s.instancesMu.RLock()
+	inst := s.instances[id]
+	s.instancesMu.RUnlock()
+	if inst == nil || isReplaceableResumePlaceholder(inst) {
+		return ""
+	}
+	inst.mu.RLock()
+	status := inst.Status
+	inst.mu.RUnlock()
+	return "instance is already registered as " + status
 }
 
 // Start launches the web server.
@@ -1366,41 +1452,12 @@ func (s *Server) Start() error {
 	}
 
 	// ── Auto-resume interrupted scan queue after short startup delay ──
-	// Gate the resume on no scan having started in the meantime — without
-	// this, a user request arriving in the first 5 seconds would race with
-	// the auto-resume goroutine and both runMultiScan calls would stomp
-	// on the same cancelScan field.
+	// A scan that starts in the meantime does not stop the resume: each
+	// resumed queue waits for its own admission slot (see
+	// autoResumeInterruptedQueues).
 	go func() {
 		time.Sleep(3 * time.Second) // let HTTP server fully initialize
-		s.queueResumeMu.Lock()
-		defer s.queueResumeMu.Unlock()
-		if s.running.Load() || s.hasQueueResumeLaunchingLocked() {
-			log.Printf("[AUTO-RESUME] Skipping — a scan execution is already active.")
-			return
-		}
-		entries := autoResumeQueueEntries(s.validQueueStateEntries(true))
-		if len(entries) == 0 {
-			return
-		}
-		log.Printf("[AUTO-RESUME] Resuming %d interrupted scan queue(s)", len(entries))
-		for _, entry := range entries {
-			if s.stopReq.Load() {
-				break
-			}
-			req := scanRequestFromQueueState(entry.state, entry.path)
-			if len(req.Targets) == 0 {
-				continue
-			}
-			instanceID := entry.state.InstanceID
-			log.Printf("[AUTO-RESUME] Resuming interrupted scan queue %s: %d targets from index %d", instanceID, len(req.Targets), entry.state.CurrentIdx)
-			scanCfg := *s.cfg
-			resumeKey := queueResumeEntryKey(entry)
-			s.markQueueResumeLaunchingLocked(resumeKey)
-			go func(e queueStateEntry, r ScanRequest, cfg config.Config, id string, key string) {
-				defer s.clearQueueResumeLaunching(key)
-				s.runMultiScan(r, &cfg, id)
-			}(entry, req, scanCfg, instanceID, resumeKey)
-		}
+		s.autoResumeInterruptedQueues()
 	}()
 
 	// ── Graceful shutdown on SIGTERM/SIGINT ──
@@ -1643,25 +1700,32 @@ func (s *Server) initDataDir() {
 		log.Printf("Error: failed to create data directory %s: %v", s.dataDir, err)
 	}
 
-	// Cleanup scans older than 30 days
+	// Cleanup scans older than 30 days. Only folders that hold scan output
+	// age out here: reserved/system entries (upload stores, schedules, saved
+	// scans, dot-prefixed state) and folders without a scan record are kept.
 	entries, _ := os.ReadDir(s.dataDir)
 	cutoff := time.Now().AddDate(0, 0, -30)
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		// Explicitly skip folder names starting with '_' or named 'logos'
-		if strings.HasPrefix(e.Name(), "_") || e.Name() == "logos" {
+		name := e.Name()
+		if strings.HasPrefix(name, "_") || reservedTopLevelEntry(name) {
 			continue
 		}
 		info, err := e.Info()
 		if err != nil {
 			continue
 		}
-		if info.ModTime().Before(cutoff) {
-			_ = os.RemoveAll(filepath.Join(s.dataDir, e.Name()))
-			log.Printf("Cleaned up old scan: %s", e.Name())
+		if !info.ModTime().Before(cutoff) {
+			continue
 		}
+		dir := filepath.Join(s.dataDir, name)
+		if !dirHoldsScanRecord(dir) {
+			continue
+		}
+		_ = os.RemoveAll(dir)
+		log.Printf("Cleaned up old scan: %s", name)
 	}
 
 	// Check for interrupted queues — will auto-resume after server starts
@@ -1746,7 +1810,7 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 	// id never produces a "started" instance the operator then has
 	// to clean up.
 	if _, err := s.resolveScanCredentials(r.Context(), req, s.cfg); err != nil {
-		if errors.Is(err, errUnknownProviderProfile) {
+		if errors.Is(err, errUnknownProviderProfile) || errors.Is(err, errAPIBaseNeedsKey) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -1762,17 +1826,18 @@ func (s *Server) handleScan(w http.ResponseWriter, r *http.Request) {
 		// canonical R11.6 sentinel.
 	}
 
+	// The webhook and api_base are outbound destinations chosen by the
+	// caller: refuse this machine/link-local webhooks (same self-scan
+	// protection targets get) and api_base overrides that would carry the
+	// stored provider credentials somewhere else.
+	if err := s.checkScanRequestDestinations(r.Context(), req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
 	// Apply LLM provider settings from web UI securely using a copy
 	scanCfg := *s.cfg // shallow copy
-	if req.Model != "" {
-		scanCfg.LLM = req.Model
-	}
-	if req.APIKey != "" {
-		scanCfg.APIKey = req.APIKey
-	}
-	if req.APIBase != "" {
-		scanCfg.APIBase = req.APIBase
-	}
+	applyScanLLMOverrides(&scanCfg, req)
 
 	// Save-only mode: create a persistent scan config without starting execution
 	if req.SaveOnly {
@@ -1943,6 +2008,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Stop ALL running instances (use write lock since we're modifying instance state)
+	var stopped []*ScanInstance
 	s.instancesMu.Lock()
 	for _, inst := range s.instances {
 		inst.mu.Lock()
@@ -1957,10 +2023,15 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 			if inst.agent != nil {
 				inst.agent.Stop()
 			}
+			stopped = append(stopped, inst)
 		}
 		inst.mu.Unlock()
 	}
 	s.instancesMu.Unlock()
+	// Paused and rebuilt instances have no session left to write scan.json.
+	for _, inst := range stopped {
+		s.persistIdleInstanceStop(inst)
+	}
 
 	// Kill all spawned processes as a safety net
 	terminal.KillAllProcesses()
@@ -2666,6 +2737,13 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "instance stop is still finalizing", http.StatusConflict)
 			return
 		}
+		// The stop is durable in the dispatch snapshot. A paused or rebuilt
+		// instance has no session left to write scan.json, so record the stop
+		// there too; restart recovery rebuilds instances from scan.json.
+		s.instancesMu.RLock()
+		stoppedInst := s.instances[instanceID]
+		s.instancesMu.RUnlock()
+		s.persistIdleInstanceStop(stoppedInst)
 		if err := s.clearQueueStateDurable(instanceID); err != nil {
 			log.Printf("[queue] exact stop persisted for %s but queue deletion failed: %v", instanceID, err)
 			http.Error(w, "instance stopped but queue cleanup was not durable", http.StatusInternalServerError)
@@ -2750,6 +2828,9 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 		// user stop is terminal (non-resumable); the runMultiScan defer also
 		// clears it on exit, so this is just the prompt path (issue #239).
 		s.clearQueueState(instanceID)
+		// A paused or rebuilt instance has no session left to write its
+		// scan.json; without this a restart rebuilds it as paused.
+		s.persistIdleInstanceStop(inst)
 
 		// Broadcast stop to clients watching this instance
 		s.broadcastToInstance(instanceID, WSEvent{Type: "stopped", Content: "Instance stopped by user"})
@@ -2930,8 +3011,39 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		req, ok, reason := s.scanRequestForPausedInstance(instanceID, inst)
+		// The paused run holds its queue lock until it has fully exited. Take
+		// the lock before reading the saved queue state, which that run may
+		// still be writing, and so that a resume (with new_id too) never runs
+		// beside it on the same scan dir.
+		ownership, owned, err := s.acquireQueueOwnershipWithin(r.Context(), inst.ID, queueOwnershipWait)
+		if err != nil {
+			log.Printf("[scan] resume %s: could not lock the scan queue: %v", inst.ID, err)
+			http.Error(w, "cannot resume: could not lock the scan queue", http.StatusInternalServerError)
+			return
+		}
+		if !owned {
+			message := "cannot resume: the paused run is still shutting down; retry shortly"
+			s.instancesMu.RLock()
+			stillRegistered := s.instances[inst.ID] == inst
+			s.instancesMu.RUnlock()
+			inst.mu.RLock()
+			stillPaused := inst.Status == "paused"
+			inst.mu.RUnlock()
+			if !stillRegistered || !stillPaused {
+				// Another resume replaced it, or it was stopped, and the
+				// lock belongs to that run now.
+				message = "cannot resume: " + errPausedInstanceGone.Error()
+			}
+			w.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
+			return
+		}
+
+		// Key everything on the resolved instance, not the URL id, which may
+		// be a record id that resolveInstanceForAction mapped to it.
+		req, ok, reason := s.scanRequestForPausedInstance(inst.ID, inst)
 		if !ok {
+			ownership.release()
 			w.WriteHeader(http.StatusConflict)
 			_ = json.NewEncoder(w).Encode(map[string]string{
 				"error": "cannot resume: " + reason,
@@ -2939,20 +3051,49 @@ func (s *Server) handleInstanceAction(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Remove the paused instance — a new one will be created by runMultiScan
-		s.instancesMu.Lock()
-		delete(s.instances, instanceID)
-		s.instancesMu.Unlock()
-
-		scanCfg := *s.cfg
-		targetID := instanceID
+		targetID := inst.ID
 		if r.URL.Query().Get("new_id") == "true" {
 			targetID = randomSlug()
+		} else {
+			// The new run keeps the lock for its whole lifetime.
+			req.queueOwnership = ownership
 		}
-		go s.runMultiScan(req, &scanCfg, targetID)
+		// Register the replacement now, in the step that removes the paused
+		// instance, rather than in the scan goroutine: a refusal (a durable
+		// exact stop, a concurrent resume) then answers this request and
+		// leaves the paused instance in place instead of dropping it after a
+		// 200, so that later resumes got 404.
+		req.resumeReplaces = inst
+		run, err := s.registerMultiScan(req, targetID)
+		if targetID != inst.ID {
+			// The paused run has exited; the new run owns its own ID's lock.
+			ownership.release()
+		}
+		if err != nil {
+			var tombstoned *tombstonedDispatchError
+			if errors.As(err, &tombstoned) {
+				// The durable snapshot says this scan was stopped; stop
+				// presenting it as paused and resumable.
+				s.settlePausedInstanceTombstone(inst, tombstoned.snapshot)
+				s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: inst.ID})
+			}
+			code := http.StatusConflict
+			if !errors.As(err, &tombstoned) && !errors.Is(err, errPausedInstanceGone) &&
+				!errors.Is(err, errInstanceIDInUse) && !errors.Is(err, errQueueOwnedElsewhere) {
+				code = http.StatusInternalServerError
+			}
+			w.WriteHeader(code)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error": "cannot resume: " + err.Error(),
+			})
+			return
+		}
 
-		s.broadcastToInstance(instanceID, WSEvent{Type: "resumed", Content: "Scan resumed"})
-		s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: instanceID})
+		scanCfg := *s.cfg
+		go s.runRegisteredMultiScan(run, &scanCfg)
+
+		s.broadcastToInstance(inst.ID, WSEvent{Type: "resumed", Content: "Scan resumed"})
+		s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: inst.ID})
 		_ = json.NewEncoder(w).Encode(map[string]string{"status": "resumed", "instance_id": targetID})
 		return
 	}
@@ -3546,8 +3687,9 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	if scanID == "" || scanID == "latest" {
 		// Find the latest top-level scan by StartedAt using the events-free
 		// summaries (cheap), then load only that one record with an event tail.
+		all := s.findAllScanSummaries()
 		summaries := []scanEntry{}
-		for _, entry := range s.findAllScanSummaries() {
+		for _, entry := range all {
 			if entry.rec.ParentTarget != "" {
 				continue
 			}
@@ -3568,7 +3710,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		s.applyInstanceSnapshot(rec, true)
-		s.attachWildcardSubScans(rec)
+		s.attachWildcardSubScansForDetail(rec, func() []scanEntry { return all })
 		finalizeScanRecordForResponse(rec)
 		finalizeEventsMeta(rec)
 		s.markDiscordWebhookConfigured(rec)
@@ -3584,8 +3726,10 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	// may differ from scan record IDs (directory slugs). We need to clean up both.
 	if r.Method == http.MethodDelete {
 		// Try to find and delete from disk
+		// safeToDeleteScanDir keeps the delete inside Data_Dir and out of the
+		// upload stores, where uploaded content can carry a scan.json.
 		dir, rec := s.findScanByID(scanID)
-		if dir != "" {
+		if dir != "" && s.safeToDeleteScanDir(dir) {
 			_ = os.RemoveAll(dir)
 		}
 		if rec != nil {
@@ -3593,7 +3737,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 				if entry.dir == dir {
 					continue
 				}
-				if isChildOfScan(rec, &entry.rec) {
+				if isChildOfScan(rec, &entry.rec) && s.safeToDeleteScanDir(entry.dir) {
 					_ = os.RemoveAll(entry.dir)
 				}
 			}
@@ -3644,15 +3788,29 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolving the scan dir and attaching wildcard sub-scans read the same
+	// summaries, so walk the data dir once per request. A finished record
+	// that can have sub-scans walks once more (see
+	// attachWildcardSubScansForDetail).
+	var summaryEntries []scanEntry
+	summariesLoaded := false
+	summaries := func() []scanEntry {
+		if !summariesLoaded {
+			summaryEntries = s.findAllScanSummaries()
+			summariesLoaded = true
+		}
+		return summaryEntries
+	}
+
 	if r.Method == http.MethodGet {
 		s.instancesMu.RLock()
 		inst := s.instances[scanID]
 		s.instancesMu.RUnlock()
 		if rec := s.scanRecordFromInstance(inst); rec != nil {
-			if dir, ok := s.resolveScanDirByID(scanID); ok {
+			if dir, ok := s.resolveScanDirByIDFrom(scanID, summaries); ok {
 				if persisted, ok2 := s.loadScanRecordForDetail(dir, detailEventTail); ok2 && persisted != nil {
 					s.applyInstanceSnapshot(persisted, true)
-					s.attachWildcardSubScans(persisted)
+					s.attachWildcardSubScansForDetail(persisted, summaries)
 					finalizeScanRecordForResponse(persisted)
 					finalizeEventsMeta(persisted)
 					s.markDiscordWebhookConfigured(persisted)
@@ -3663,7 +3821,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
-			s.attachWildcardSubScans(rec)
+			s.attachWildcardSubScansForDetail(rec, summaries)
 			finalizeScanRecordForResponse(rec)
 			finalizeEventsMeta(rec)
 			s.markDiscordWebhookConfigured(rec)
@@ -3675,7 +3833,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	dir, ok := s.resolveScanDirByID(scanID)
+	dir, ok := s.resolveScanDirByIDFrom(scanID, summaries)
 	if !ok {
 		http.Error(w, "scan not found", http.StatusNotFound)
 		return
@@ -3687,7 +3845,7 @@ func (s *Server) handleGetScan(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.applyInstanceSnapshot(rec, true)
-	s.attachWildcardSubScans(rec)
+	s.attachWildcardSubScansForDetail(rec, summaries)
 	finalizeScanRecordForResponse(rec)
 	finalizeEventsMeta(rec)
 	s.markDiscordWebhookConfigured(rec)

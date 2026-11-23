@@ -1,6 +1,7 @@
 package web
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -462,12 +463,42 @@ func (s *Server) scanRequestForPausedInstance(instanceID string, inst *ScanInsta
 
 	defaultReq.ResumeScanDir = scanDir
 	defaultReq.ResumeScanID = filepath.Base(scanDir)
-	if rec, ok := loadScanRecordFromDir(scanDir); ok && rec.Target != "" {
+	// The summary is enough for the target and skips parsing the event log.
+	if rec, ok := readScanSummary(filepath.Join(scanDir, "scan.json")); ok && rec.Target != "" {
 		defaultReq.ResumeActiveTarget = rec.Target
 	} else if len(defaultReq.Targets) > 0 {
 		defaultReq.ResumeActiveTarget = defaultReq.Targets[0]
 	}
+	defaultReq.Targets = s.pausedQueueTargets(instanceID, defaultReq.Targets, defaultReq.ResumeActiveTarget)
 	return defaultReq, true, ""
+}
+
+// pausedQueueTargets returns the targets that a paused queue without saved
+// queue state still has to scan: the paused target and the ones after it. A
+// queue scans its targets in order, so those before the paused one are done,
+// and resuming them would scan them again. An instance rebuilt after a
+// restart knows only its own scan dir's target; the exact dispatch snapshot,
+// when there is one, still lists the whole queue. If the paused target is in
+// neither list, targets is returned unchanged.
+func (s *Server) pausedQueueTargets(instanceID string, targets []string, active string) []string {
+	want := normalizeScanTarget(active)
+	if want == "" {
+		return targets
+	}
+	queues := [][]string{targets}
+	if snapshot, err := s.loadExactDispatchSnapshot(instanceID); err == nil {
+		if listed := splitInstanceTargets(snapshot.Target); len(listed) > len(targets) {
+			queues = [][]string{listed, targets}
+		}
+	}
+	for _, queue := range queues {
+		for i, target := range queue {
+			if normalizeScanTarget(target) == want {
+				return append([]string(nil), queue[i:]...)
+			}
+		}
+	}
+	return targets
 }
 
 func shouldPreserveQueueStateOnExit(status, stopReason string, panicRecovered bool) bool {
@@ -477,7 +508,7 @@ func shouldPreserveQueueStateOnExit(status, stopReason string, panicRecovered bo
 	if status == "paused" || stopReason == "user_paused" || isProviderPauseReason(stopReason) {
 		return true
 	}
-	if status == "stopped" && (stopReason == "server_shutdown" || stopReason == "server_restart_resuming") {
+	if status == "stopped" && (stopReason == "server_shutdown" || stopReason == stopReasonRestartResuming) {
 		return true
 	}
 	return strings.HasPrefix(stopReason, "signal_")
@@ -514,6 +545,22 @@ func (s *Server) instanceRunStatus(instanceID string) (string, string) {
 	stopReason := inst.StopReason
 	inst.mu.RUnlock()
 	return status, stopReason
+}
+
+// serverShuttingDown reports whether a SIGTERM/SIGINT shutdown has begun. The
+// signal handler closes shutdownChan before it stops any agent and before it
+// flips instance statuses, so a session that returns because of the shutdown
+// always observes it here even while its instance still reads "running".
+func (s *Server) serverShuttingDown() bool {
+	if s.shutdownChan == nil {
+		return false
+	}
+	select {
+	case <-s.shutdownChan:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) instanceInterrupted(instanceID string) bool {
@@ -634,6 +681,28 @@ func (s *Server) acquireQueueOwnership(instanceID string) (*queueOwnership, bool
 		return nil, false, fmt.Errorf("lock queue ownership: %w", err)
 	}
 	return &queueOwnership{file: f, path: path}, true, nil
+}
+
+// queueOwnershipWait bounds how long a resume, or a stop recording itself in
+// scan.json, waits for a paused run that is still exiting to release its
+// queue lock.
+var queueOwnershipWait = 3 * time.Second
+
+// acquireQueueOwnershipWithin retries acquireQueueOwnership until it gets the
+// lock, wait has passed, or ctx is done.
+func (s *Server) acquireQueueOwnershipWithin(ctx context.Context, instanceID string, wait time.Duration) (*queueOwnership, bool, error) {
+	deadline := time.Now().Add(wait)
+	for {
+		ownership, owned, err := s.acquireQueueOwnership(instanceID)
+		if err != nil || owned || !time.Now().Before(deadline) {
+			return ownership, owned, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, false, nil
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
 }
 
 func (ownership *queueOwnership) release() {

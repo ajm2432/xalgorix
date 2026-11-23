@@ -26,7 +26,6 @@ import (
 
 	"github.com/xalgord/xalgorix/v4/internal/llm"
 	"github.com/xalgord/xalgorix/v4/internal/scanctx"
-	"github.com/xalgord/xalgorix/v4/internal/scopeguard"
 	"github.com/xalgord/xalgorix/v4/internal/tools"
 	"github.com/xalgord/xalgorix/v4/internal/tools/browser"
 	"github.com/xalgord/xalgorix/v4/internal/tools/httpclient"
@@ -59,6 +58,8 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	// Restricted, read-only tool registry — no reporting, no agent spawning.
 	vreg := tools.NewRegistry()
 	vreg.SetScanContextID(a.scanCtx.ID)
+	vreg.SetRequestGuard(a.checkHTTPHop)
+	vreg.SetDialGuard(a.checkDialAddr)
 	terminal.Register(vreg)
 	httpclient.Register(vreg)
 	browser.Register(vreg)
@@ -69,6 +70,10 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 	// missing-file control. Ordinary HTTP clients often normalize these paths
 	// before transmission, creating a false negative for real file reads.
 	a.registerVerifyPathTraversalTool(vreg)
+	// Re-run the canonical-vs-variant unauthenticated differential so the
+	// independent verifier can reproduce an enforcement bypass that identity-
+	// based re-testing would miss.
+	a.registerVerifyAuthBypassTool(vreg)
 
 	var verdict *reporting.VerificationVerdict
 	vreg.Register(&tools.Tool{
@@ -154,7 +159,8 @@ func (a *Agent) verifyFinding(req reporting.VerificationRequest) reporting.Verif
 			// applies, so the verifier cannot probe out-of-scope/local hosts and
 			// a hung re-test cannot outlive the report_vulnerability call.
 			res := a.execVerifierToolGuarded(vreg, tc.Name, tc.Args, deadline)
-			if res.Error == "" && res.Output != "" && !strings.Contains(res.Output, "OUT-OF-SCOPE TARGET BLOCKED") {
+			if res.Error == "" && res.Output != "" && !strings.Contains(res.Output, "OUT-OF-SCOPE TARGET BLOCKED") &&
+				!strings.Contains(res.Output, "OUTSIDE SCAN BOUNDARY") {
 				switch tc.Name {
 				case "http_request", "terminal_execute", "browser_action", "verify_path_traversal", "oob_poll":
 					hasRetest = true
@@ -226,12 +232,14 @@ func (a *Agent) execVerifierToolGuarded(vreg *tools.Registry, name string, args 
 	if a.ctx != nil && a.ctx.Err() != nil {
 		return tools.Result{Error: "agent stopped during verification"}
 	}
-	if name == "http_request" && scopeguard.IsLocalOrListener(a.localGuard, args["url"]) {
-		return tools.Result{Output: "⛔ OUT-OF-SCOPE TARGET BLOCKED — the HTTP request points at the operator's machine or listener. Submit an inconclusive verdict if it cannot be independently verified."}
-	}
+	// shouldBlockForOutOfScope covers http_request's destination too.
 	if blocked, reason := a.shouldBlockForOutOfScope(name, args); blocked {
 		return tools.Result{Output: "⛔ OUT-OF-SCOPE TARGET BLOCKED — " + reason +
 			"\nYou cannot probe this host during verification. If the finding depends on reaching it, it is not independently verifiable here — submit an 'inconclusive' verdict."}
+	}
+	if blocked, reason := a.shouldBlockForTargetScope(name, args); blocked {
+		return tools.Result{Output: "⛔ OUTSIDE SCAN BOUNDARY — " + reason +
+			"\nIf the finding depends on it, it is outside this scan — submit an 'inconclusive' verdict."}
 	}
 
 	remaining := time.Until(deadline)

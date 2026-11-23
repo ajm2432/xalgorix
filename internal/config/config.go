@@ -82,6 +82,16 @@ type Config struct {
 	// parameter, and core description. XALGORIX_LEAN_TOOL_SCHEMA, default false.
 	LeanToolSchema bool
 
+	// PhasePlaybooks sends each large methodology phase only while it is in
+	// use. The root agent's system prompt keeps every phase heading and the
+	// small phases; the bodies of large phases that plan tasks can trigger are
+	// added to the conversation, word for word, while the phase has an active
+	// task, the agent is testing one of its classes, or it is among the
+	// lowest phases with ready tasks. Cuts the per-call prompt; meant to be
+	// A/B-tested on findings before it is turned on.
+	// XALGORIX_PHASE_PLAYBOOKS, default false.
+	PhasePlaybooks bool
+
 	// AdvancePastStuckTasks changes the stall response: when a scan makes no new
 	// assessment evidence within the idle limit, instead of terminating the
 	// WHOLE scan, the engine marks the current stalled task blocked and steers
@@ -103,7 +113,7 @@ type Config struct {
 	// retrieves the byte-identical original). The recent window stays
 	// verbatim, so every byte the model could previously see remains
 	// reachable — it is fetched on demand instead of being resent on every
-	// iteration. XALGORIX_BOUNDED_CONTEXT, default false (off).
+	// iteration. XALGORIX_BOUNDED_CONTEXT, default true (on).
 	BoundedContext bool
 
 	// EpochCoverage enables epoch-based coverage convergence: per-endpoint
@@ -112,7 +122,7 @@ type Config struct {
 	// set, so class tasks can actually close and the scan reaches a clean
 	// terminal state instead of chasing a receding bar forever. No coverage is
 	// dropped — every discovered endpoint is folded into a later epoch and
-	// tested before finish. XALGORIX_EPOCH_COVERAGE, default false (off).
+	// tested before finish. XALGORIX_EPOCH_COVERAGE, default true (on).
 	EpochCoverage bool
 
 	// ConvergeReconcile closes out class-less exploratory plan tasks once every
@@ -122,7 +132,7 @@ type Config struct {
 	// (taskCoverageComplete) can never close them — left open they hold a scan in
 	// an unbounded churn at 100% systematic coverage. No measured coverage is
 	// dropped: the full matrix is already satisfied before anything closes.
-	// XALGORIX_CONVERGE_RECONCILE, default false (off).
+	// XALGORIX_CONVERGE_RECONCILE, default true (on).
 	ConvergeReconcile bool
 
 	// EndpointHygiene keeps the endpoint accounting (DiscoveredEndpoints,
@@ -144,7 +154,7 @@ type Config struct {
 	// structured methodology is done, per-route coverage clears a threshold, and
 	// no new finding appears for a sustained tail, the remaining per-endpoint
 	// class tasks close as coverage-sufficient with the residual (route,class)
-	// pairs recorded in the report. XALGORIX_CONVERGE_FINISH, default false (off).
+	// pairs recorded in the report. XALGORIX_CONVERGE_FINISH, default true (on).
 	ConvergeFinish bool
 
 	// ConvergeFinishIdle is the no-new-finding tail (iterations) for the
@@ -305,11 +315,13 @@ type Config struct {
 
 	// ScanHeaders are operator-supplied custom HTTP headers ("Name: value")
 	// injected into all TARGET-facing scan traffic to identify an authorized
-	// Xalgorix run: the agent's HTTP client and, via their -H flag, bundled
-	// tools (httpx, nuclei). Built-in equivalent of Nuclei's -H/-header. Bug-
-	// bounty programs often require such a header (e.g. "X-Bug-Bounty: user");
-	// it also lets a target's WAF/SOC allow-list the scan. Never attached to
-	// non-target destinations (LLM APIs, notifications, the dashboard).
+	// Xalgorix run: the agent's HTTP client and, in each tool's own header
+	// syntax, the httpx, nuclei, curl and wget commands it runs. Built-in
+	// equivalent of Nuclei's -H/-header. Bug-bounty programs often require
+	// such a header (e.g. "X-Bug-Bounty: user"); it also lets a target's
+	// WAF/SOC allow-list the scan. The engine never attaches them to its own
+	// destinations (LLM APIs, notifications, the dashboard); a curl or wget
+	// command the agent runs carries them to whatever host it requests.
 	// XALGORIX_SCAN_HEADERS (';'/newline-separated) and/or
 	// XALGORIX_SCAN_HEADERS_FILE (one per line); repeatable -H on the CLI.
 	ScanHeaders []string
@@ -415,6 +427,13 @@ type Config struct {
 	AllowAutoInstall     bool // XALGORIX_ALLOW_AUTO_INSTALL - permit package auto-install (default false unless root)
 	AllowAutoInstallSudo bool // XALGORIX_AUTO_INSTALL_SUDO  - permit sudo-prefixed installs (default false)
 
+	// ProcessIsolation runs each scan's terminal and python commands in a PID
+	// namespace of their own, so ps/kill/pkill inside a scan see and reach only
+	// that scan's processes, never the host's services, the engine or another
+	// scan. Linux only, and it needs root (CAP_SYS_ADMIN); elsewhere commands
+	// run as before. XALGORIX_PROCESS_ISOLATION (default true).
+	ProcessIsolation bool
+
 	// Proxy settings
 	UseProxy      bool   // XALGORIX_USE_PROXY — enable proxy support
 	ProxyRequired bool   // XALGORIX_PROXY_REQUIRED — require one configured proxy for target-facing HTTP/browser traffic
@@ -512,7 +531,7 @@ func load() *Config {
 		KeyPoolStrategy:          envOr("XALGORIX_KEY_POOL_STRATEGY", "roundrobin"),
 		DisableAutoDelegate:      envOrBool("XALGORIX_DISABLE_AUTO_DELEGATE", false),
 		DisabledSpecialists:      envOrStringSlice("XALGORIX_DISABLED_SPECIALISTS"),
-		Checklist:                envOrChecklist(envOr("XALGORIX_CHECKLIST", "full")),
+		Checklist:                NormalizeChecklist(envOr("XALGORIX_CHECKLIST", "full")),
 		LLMProfile:               envOr("XALGORIX_LLM_PROFILE", ""),
 		ReasoningEffort:          envOr("XALGORIX_REASONING_EFFORT", "high"),
 		Language:                 NormalizeLanguage(envOr("XALGORIX_LANGUAGE", DefaultLanguage)),
@@ -524,13 +543,14 @@ func load() *Config {
 		ContextCompactTokens:     envOrInt("XALGORIX_CONTEXT_COMPACT_TOKENS", -1),
 		RoleScopedTools:          envOrBool("XALGORIX_ROLE_SCOPED_TOOLS", false),
 		LeanToolSchema:           envOrBool("XALGORIX_LEAN_TOOL_SCHEMA", false),
+		PhasePlaybooks:           envOrBool("XALGORIX_PHASE_PLAYBOOKS", false),
 		AdvancePastStuckTasks:    envOrBool("XALGORIX_ADVANCE_PAST_STUCK", false),
 		MaxStuckAdvances:         envOrInt("XALGORIX_MAX_STUCK_ADVANCES", 3),
-		BoundedContext:           envOrBool("XALGORIX_BOUNDED_CONTEXT", false),
-		EpochCoverage:            envOrBool("XALGORIX_EPOCH_COVERAGE", false),
-		ConvergeReconcile:        envOrBool("XALGORIX_CONVERGE_RECONCILE", false),
+		BoundedContext:           envOrBool("XALGORIX_BOUNDED_CONTEXT", true),
+		EpochCoverage:            envOrBool("XALGORIX_EPOCH_COVERAGE", true),
+		ConvergeReconcile:        envOrBool("XALGORIX_CONVERGE_RECONCILE", true),
 		EndpointHygiene:          envOrBool("XALGORIX_ENDPOINT_HYGIENE", false),
-		ConvergeFinish:           envOrBool("XALGORIX_CONVERGE_FINISH", false),
+		ConvergeFinish:           envOrBool("XALGORIX_CONVERGE_FINISH", true),
 		ConvergeFinishIdle:       envOrInt("XALGORIX_CONVERGE_FINISH_IDLE", 500),
 		ConvergeFinishLeadWindow: envOrInt("XALGORIX_CONVERGE_FINISH_LEAD_WINDOW", 100),
 		ToolArchiveMinBytes:      envOrInt("XALGORIX_TOOL_ARCHIVE_MIN_BYTES", 1500),
@@ -629,6 +649,8 @@ func load() *Config {
 		AllowAutoInstall:     envOrBool("XALGORIX_ALLOW_AUTO_INSTALL", os.Getuid() == 0),
 		AllowAutoInstallSudo: envOrBool("XALGORIX_AUTO_INSTALL_SUDO", false),
 
+		ProcessIsolation: envOrBool("XALGORIX_PROCESS_ISOLATION", true),
+
 		// Proxy
 		UseProxy:      envOrBool("XALGORIX_USE_PROXY", false),
 		ProxyRequired: envOrBool("XALGORIX_PROXY_REQUIRED", false),
@@ -641,9 +663,10 @@ func load() *Config {
 		SkillsDir:   filepath.Join(xalgorixHome, "skills"),
 		BrowserPath: envOr("XALGORIX_BROWSER_PATH", ""),
 
-		// Filesystem read deny-list. Defaults applied in resolveReadDenyList
-		// (sensitive home and system paths); user list extends them.
-		ReadDenyList: resolveReadDenyList(home, os.Getenv("XALGORIX_READ_DENY_LIST")),
+		// Filesystem deny-list. Defaults applied in resolveReadDenyList
+		// (sensitive home and system paths plus the scanner's own
+		// credential files); user list extends them.
+		ReadDenyList: resolveReadDenyList(home, dataDir, os.Getenv("XALGORIX_READ_DENY_LIST")),
 	}
 
 	// Debug: show loaded config so users can verify correct env was picked up.
@@ -1029,12 +1052,56 @@ func defaultReadDenyList(home string) []string {
 	}
 }
 
-// resolveReadDenyList composes the default deny-list with any extra
-// entries supplied via XALGORIX_READ_DENY_LIST. Entries in the env var
-// are colon-separated (Linux PATH convention); an empty string yields
-// the defaults. Empty tokens are skipped.
-func resolveReadDenyList(home, raw string) []string {
+// scannerCredentialPaths lists the files where Xalgorix keeps its own
+// credentials: the dotenv files load() reads at startup (dashboard
+// password, API tokens, provider keys), the provider key store and auth
+// profile store at the Data_Dir root, and the CLI credential files the
+// OAuth drivers in internal/auth import. The agent never needs these to
+// test a target, and the key store and profile store sit inside the
+// write Allow_List (Data_Dir), so listing them here keeps the
+// Filesystem_Tools from reading or rewriting them.
+func scannerCredentialPaths(home, dataDir string) []string {
+	if home == "" {
+		home = "/root"
+	}
+	out := []string{
+		"/etc/xalgorix.env",
+		"/root/.xalgorix.env",
+		filepath.Join(home, ".xalgorix.env"),
+		// OAuth driver credential sources (internal/auth/driver_*.go).
+		filepath.Join(home, ".claude", ".credentials.json"),
+		filepath.Join(home, ".config", "anthropic", "credentials.json"),
+		filepath.Join(home, ".codex", "auth.json"),
+	}
+	if sudoUser := strings.TrimSpace(os.Getenv("SUDO_USER")); sudoUser != "" {
+		out = append(out, filepath.Join("/home", sudoUser, ".xalgorix.env"))
+	}
+	if codexHome := strings.TrimSpace(os.Getenv("CODEX_HOME")); codexHome != "" {
+		out = append(out, filepath.Join(codexHome, "auth.json"))
+	}
+	if codexFile := strings.TrimSpace(os.Getenv("XALGORIX_CODEX_AUTH_FILE")); codexFile != "" {
+		out = append(out, codexFile)
+	}
+	if dataDir != "" {
+		// Prefix matching also covers the legacy nested
+		// <dataDir>/llm_keys.json/llm_keys.json layout.
+		out = append(out,
+			filepath.Join(dataDir, "llm_keys.json"),
+			filepath.Join(dataDir, "auth-profiles.json"),
+		)
+	}
+	return out
+}
+
+// resolveReadDenyList composes the default deny-list and the scanner's
+// own credential files with any extra entries supplied via
+// XALGORIX_READ_DENY_LIST. Entries in the env var are colon-separated
+// (Linux PATH convention); an empty string yields the defaults. Empty
+// tokens are skipped. The sandbox applies the result to reads and,
+// with precedence over the write Allow_List, to writes.
+func resolveReadDenyList(home, dataDir, raw string) []string {
 	out := defaultReadDenyList(home)
+	out = append(out, scannerCredentialPaths(home, dataDir)...)
 	if raw == "" {
 		return out
 	}
@@ -1072,8 +1139,11 @@ func ParseAPIKeyList(raw string) []string {
 	return out
 }
 
-// envOrChecklist validates the XALGORIX_CHECKLIST value.
-func envOrChecklist(raw string) string {
+// NormalizeChecklist validates an XALGORIX_CHECKLIST value: "professional"
+// selects the compact workflow and anything else the full checklist. The
+// dashboard settings page shares it so a value saved there reaches new scans
+// exactly as it would after a restart.
+func NormalizeChecklist(raw string) string {
 	v := strings.ToLower(strings.TrimSpace(raw))
 	if v == "professional" {
 		return "professional"

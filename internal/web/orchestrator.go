@@ -38,12 +38,56 @@ func isReplaceableResumePlaceholder(inst *ScanInstance) bool {
 	}
 	inst.mu.RLock()
 	defer inst.mu.RUnlock()
-	return inst.Status == "pending" && inst.agent == nil && inst.cancel == nil && inst.StopReason == "server_restart_resuming"
+	return inst.Status == "pending" && inst.agent == nil && inst.cancel == nil && inst.StopReason == stopReasonRestartResuming
+}
+
+// multiScanRun is a scan queue whose instance registerMultiScan installed in
+// s.instances. It holds the queue ownership lock until runRegisteredMultiScan
+// returns.
+type multiScanRun struct {
+	req        ScanRequest
+	instanceID string
+	instance   *ScanInstance
+	ownership  *queueOwnership
+	// placeholderDir is the scan dir of the restart-recovery placeholder
+	// this run replaced, if any.
+	placeholderDir string
+}
+
+var (
+	errQueueOwnedElsewhere = errors.New("the scan queue is still owned by another run")
+	errPausedInstanceGone  = errors.New("the instance is no longer paused, or another resume claimed it")
+	errInstanceIDInUse     = errors.New("the instance id is already in use")
+)
+
+// tombstonedDispatchError means the durable exact snapshot for the instance ID
+// is terminal or stopping, so no new run may start under that ID.
+type tombstonedDispatchError struct {
+	snapshot *ScanRecord
+}
+
+func (e *tombstonedDispatchError) Error() string {
+	return fmt.Sprintf("the instance was already %s", e.snapshot.Status)
 }
 
 // runMultiScan processes targets sequentially, one at a time.
 // Each target is scanned in a fully isolated scanSession.
 func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceIDs ...string) {
+	run, err := s.registerMultiScan(req, instanceIDs...)
+	if err != nil {
+		// registerMultiScan has logged why it refused.
+		return
+	}
+	s.runRegisteredMultiScan(run, scanCfg)
+}
+
+// registerMultiScan takes the queue ownership lock for the instance ID, checks
+// the durable exact snapshot, and installs the pending instance, all before
+// any scan work starts. On refusal it releases the lock and leaves
+// s.instances unchanged, so a caller can report the refusal instead of losing
+// the instance it meant to replace. req.resumeReplaces names a paused instance
+// that the new run replaces in the same step that installs it.
+func (s *Server) registerMultiScan(req ScanRequest, instanceIDs ...string) (*multiScanRun, error) {
 	normalizeScanRequestActivity(&req)
 
 	// Defensively flatten req.Targets in case the frontend or API sent them as a comma-separated mega string
@@ -97,14 +141,22 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 		ownership, owned, err = s.acquireQueueOwnership(instanceID)
 		if err != nil {
 			log.Printf("[queue] refusing instance %s: could not acquire ownership: %v", instanceID, err)
-			return
+			return nil, fmt.Errorf("could not acquire queue ownership: %w", err)
 		}
 		if !owned {
 			log.Printf("[queue] refusing instance %s: queue is owned by another process", instanceID)
-			return
+			return nil, errQueueOwnedElsewhere
 		}
 	}
-	defer ownership.release()
+	registered := false
+	defer func() {
+		if !registered {
+			ownership.release()
+		}
+	}()
+	resumeReplaces := req.resumeReplaces
+	req.resumeReplaces = nil
+	placeholderDir := ""
 
 	// Register instance as pending initially
 	instance := &ScanInstance{
@@ -167,13 +219,13 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 			delete(s.dispatchReservations, instanceID)
 			s.dispatchMu.Unlock()
 			log.Printf("[scan] refusing dispatch %q after durable exact stop/status %q", instanceID, durable.Status)
-			return
+			return nil, &tombstonedDispatchError{snapshot: durable}
 		}
 	} else if durErr != nil && !errors.Is(durErr, errDispatchSnapshotNotFound) {
 		delete(s.dispatchReservations, instanceID)
 		s.dispatchMu.Unlock()
 		log.Printf("[scan] refusing dispatch %q with unreadable durable state: %v", instanceID, durErr)
-		return
+		return nil, fmt.Errorf("unreadable durable dispatch state: %w", durErr)
 	}
 	if req.IsResume && durable != nil {
 		instance.TotalTokens = max(instance.TotalTokens, durable.TotalTokens)
@@ -181,16 +233,22 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 		instance.UsageBySession = mergeSessionUsage(instance.UsageBySession, durable.UsageBySession)
 	}
 	s.instancesMu.Lock()
-	if existing := s.instances[instanceID]; existing != nil {
+	existing := s.instances[instanceID]
+	if existing == resumeReplaces {
+		// Resuming under the same ID: the paused entry is replaced below.
+		existing = nil
+	}
+	if existing != nil {
 		replaceableResumePlaceholder := req.IsResume && isReplaceableResumePlaceholder(existing)
 		if !replaceableResumePlaceholder {
 			s.instancesMu.Unlock()
 			delete(s.dispatchReservations, instanceID)
 			s.dispatchMu.Unlock()
 			log.Printf("[scan] refusing live instance id collision for %q", instanceID)
-			return
+			return nil, errInstanceIDInUse
 		}
 		existing.mu.RLock()
+		placeholderDir = existing.scanDir
 		if existing.Iterations > instance.Iterations {
 			instance.Iterations = existing.Iterations
 		}
@@ -220,7 +278,17 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 		delete(s.dispatchReservations, instanceID)
 		s.dispatchMu.Unlock()
 		log.Printf("[scan] refusing legacy persisted instance id collision for %q", instanceID)
-		return
+		return nil, errInstanceIDInUse
+	}
+	// Remove the paused instance in the same critical section that installs
+	// its replacement, so the paused scan is never missing from the map: a
+	// refusal anywhere above leaves it in place and resumable.
+	if resumeReplaces != nil && !s.claimPausedInstanceLocked(resumeReplaces) {
+		s.instancesMu.Unlock()
+		delete(s.dispatchReservations, instanceID)
+		s.dispatchMu.Unlock()
+		log.Printf("[scan] refusing resume %q: paused instance %q is no longer paused or was already resumed", instanceID, resumeReplaces.ID)
+		return nil, errPausedInstanceGone
 	}
 	if req.IsResume {
 		retainKnownSessionProgress(instance)
@@ -229,6 +297,17 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 	delete(s.dispatchReservations, instanceID)
 	s.instancesMu.Unlock()
 	s.dispatchMu.Unlock()
+	registered = true
+	return &multiScanRun{req: req, instanceID: instanceID, instance: instance, ownership: ownership, placeholderDir: placeholderDir}, nil
+}
+
+// runRegisteredMultiScan runs a scan queue that registerMultiScan registered,
+// and releases its queue ownership lock when the queue ends.
+func (s *Server) runRegisteredMultiScan(run *multiScanRun, scanCfg *config.Config) {
+	req := run.req
+	instanceID := run.instanceID
+	instance := run.instance
+	defer run.ownership.release()
 
 	// Persist the queue state immediately, BEFORE the admission wait loop.
 	// Previously the first saveQueueState ran only after admission (well past
@@ -350,6 +429,20 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 		} else {
 			log.Printf("[queue] preserving queue state for %s because exact terminal persistence failed", instanceID)
 		}
+		// No session writes this queue's scan.json any more. A stop that
+		// landed after the last session ended, or before the first one started
+		// on a resumed scan, has not reached it; record it so a restart does
+		// not rebuild the stopped scan as paused. Read the status again: a
+		// paused run can be stopped while it exits. A stop after this point
+		// records itself once this run releases the queue lock.
+		instance.mu.RLock()
+		lastScanDir := instance.scanDir
+		currentStatus, currentStopReason, finishedAt := instance.Status, instance.StopReason, instance.FinishedAt
+		instance.mu.RUnlock()
+		if lastScanDir == "" {
+			lastScanDir = req.ResumeScanDir
+		}
+		s.persistStopToScanDir(lastScanDir, currentStatus, currentStopReason, finishedAt)
 		s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: instanceID})
 		time.Sleep(500 * time.Millisecond)
 
@@ -491,6 +584,9 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 
 	// Instance got a slot — mark that the scan ran for full cleanup
 	ranScan = true
+	// A resumed scan is running again: take its durable records out of the
+	// restart-recovery pending state now, not when a session next saves.
+	s.recordRestartResumeStarted(run)
 
 	s.broadcastDashboard(WSEvent{Type: "instance_updated", Content: instanceID})
 
@@ -535,11 +631,17 @@ func (s *Server) runMultiScan(req ScanRequest, scanCfg *config.Config, instanceI
 		CurrentPhase: firstSelectedPhase(req.Phases),
 	})
 
-	// Discord: scan started
-	s.sendDiscordTo(scanDiscordWebhook, 0x00ff88, "🚀 Scan Started", fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets))
-	// Telegram: scan started
+	// Discord/Telegram: scan started. A resumed queue (after a restart or a
+	// pause) continues an existing scan, so say so rather than announcing a
+	// second start.
+	startTitle := "🚀 Scan Started"
+	if req.IsResume {
+		startTitle = "🔁 Scan Resumed"
+	}
+	startDesc := fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets)
+	s.sendDiscordTo(scanDiscordWebhook, 0x00ff88, startTitle, startDesc)
 	if s.telegramConfigured() {
-		s.sendTelegram(0x00ff88, "🚀 Scan Started", fmt.Sprintf("**Targets:** %s\n**Mode:** %s\n**Total:** %d target(s)", strings.Join(req.Targets, ", "), req.ScanMode, totalTargets))
+		s.sendTelegram(0x00ff88, startTitle, startDesc)
 	}
 
 	interruptedQueue := false
@@ -646,15 +748,97 @@ func (s *Server) sendScanCompletionSummary(discordWebhook string, totalTargets, 
 // Mode-specific target handlers
 // ────────────────────────────────────────────────────────
 
+// Bounds on a scan folder built from a target. os.Root creates folders one
+// level at a time, so the OS path limit no longer rejects absurdly deep
+// targets; these caps keep folder creation cheap and every scan folder short
+// enough to hold its files.
+const (
+	maxScanTargetDirSegments = 32
+	maxScanDirPathLen        = 1024
+)
+
 // makeScanDir creates a per-target scan directory with nested structure: target/date/randomslug
 func (s *Server) makeScanDir(target string) string {
 	dateDir := time.Now().Format("2006-01-02")
 	scanDirName := fmt.Sprintf("%s_%s", sanitizeTarget(target), randomSlug())
-	scanDir := filepath.Join(s.dataDir, target, dateDir, scanDirName)
-	if err := os.MkdirAll(scanDir, 0700); err != nil {
+	rel := filepath.Join(scanTargetDirPath(target), dateDir, scanDirName)
+	var err error
+	if len(filepath.Join(s.dataDir, rel)) > maxScanDirPathLen {
+		err = fmt.Errorf("folder path longer than %d bytes", maxScanDirPathLen)
+	} else {
+		err = s.createScanDir(rel, true)
+	}
+	if err != nil {
+		// The target's folder is unusable (it runs through a symlink, into
+		// another scan's folder, or cannot be created). Keep the scan inside
+		// the data dir under "unknown" rather than lose its record.
+		log.Printf("[WARN] Scan folder for target %q is unusable (%v); storing the scan under unknown/", target, err)
+		rel = filepath.Join("unknown", dateDir, scanDirName)
+		err = s.createScanDir(rel, true)
+	}
+	scanDir := filepath.Join(s.dataDir, rel)
+	if err != nil {
 		log.Printf("[ERROR] Failed to create scan directory %s: %v", scanDir, err)
 	}
 	return scanDir
+}
+
+// createScanDir creates rel, a path relative to the data dir, through an
+// os.Root so a symlink already inside the data dir cannot send the new folders
+// anywhere else on disk. With refuseNested it also refuses to put a new scan
+// inside an existing scan's folder: the scan walker stops at the first
+// scan.json, so a nested scan would never be listed, retained or deleted on
+// its own.
+func (s *Server) createScanDir(rel string, refuseNested bool) error {
+	if err := os.MkdirAll(s.dataDir, 0o700); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(s.dataDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	if refuseNested {
+		for dir := filepath.Dir(rel); dir != "." && dir != string(os.PathSeparator); dir = filepath.Dir(dir) {
+			// Same test the scan walker uses: any non-folder named scan.json.
+			if info, err := root.Lstat(filepath.Join(dir, "scan.json")); err == nil && !info.IsDir() {
+				return fmt.Errorf("%s already holds a scan", dir)
+			}
+		}
+	}
+	return root.MkdirAll(rel, 0o700)
+}
+
+// scanTargetDirPath maps a scan target to the folder, relative to the data
+// dir, that its scans are stored under. Targets come from whoever starts the
+// scan, so the folder is rebuilt from the target's path segments with empty
+// and dot-only segments dropped: no target can climb out of the data dir or
+// collapse onto it. Ordinary targets keep their existing layout
+// ("example.com", "https:/example.com/app"). A first segment naming one of
+// the data dir's reserved stores (uploads, schedules, saved scans, dot state)
+// gets a prefix so scan output never lands inside those stores.
+func scanTargetDirPath(target string) string {
+	segments := strings.FieldsFunc(target, func(r rune) bool {
+		return r == '/' || r == filepath.Separator
+	})
+	kept := make([]string, 0, len(segments))
+	for _, seg := range segments {
+		// "." and ".." (and longer runs of dots) never name a target folder.
+		if strings.Trim(seg, ". ") == "" {
+			continue
+		}
+		if len(kept) == maxScanTargetDirSegments {
+			return "unknown"
+		}
+		kept = append(kept, seg)
+	}
+	if len(kept) == 0 {
+		return "unknown"
+	}
+	if reservedTopLevelEntry(kept[0]) {
+		kept[0] = "target-" + kept[0]
+	}
+	return strings.Join(kept, string(os.PathSeparator))
 }
 
 func (s *Server) findLatestScanDirForTarget(target string) string {
@@ -718,7 +902,7 @@ func (s *Server) resumeScanDirOrNew(scanDir, target string) (string, bool) {
 		log.Printf("[AUTO-RESUME] Ignoring unsafe resume scan dir %q", scanDir)
 		return s.makeScanDir(target), false
 	}
-	if err := os.MkdirAll(cleanDir, 0700); err != nil {
+	if err := s.createScanDir(rel, false); err != nil {
 		log.Printf("[AUTO-RESUME] Failed to reuse scan dir %s: %v", cleanDir, err)
 		return s.makeScanDir(target), false
 	}
@@ -1301,10 +1485,21 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 
 	// ── PHASE 2: Scan each subdomain individually ──
 	wildcardStopped := false
+	// interruptReason is the recoverable stop reason when the loop ends because
+	// of a server shutdown observed before the instance status was flipped.
+	interruptReason := ""
 	for j := resumeFromSubIndex; j < len(subdomains); j++ {
 		subdomain := subdomains[j]
-		// Per-instance stop only (Stop All / single-stop / pause / delete all
-		// flip the instance status, which instanceInterrupted observes).
+		// Stop All / single-stop / pause / delete flip the instance status,
+		// which instanceInterrupted observes. A server shutdown is checked
+		// separately: its signal handler flips instance statuses only after
+		// it has already stopped the agents.
+		if s.serverShuttingDown() {
+			log.Printf("[INFO] Subdomain loop interrupted by server shutdown at %d/%d for %s", j+1, len(subdomains), target)
+			interruptReason = "server_shutdown"
+			wildcardStopped = true
+			break
+		}
 		if s.instanceInterrupted(req.InstanceID) {
 			log.Printf("[INFO] Subdomain loop stopped by user at %d/%d for %s", j+1, len(subdomains), target)
 			if !serverInstanceHasExactStopEvent(s, req.InstanceID) {
@@ -1399,7 +1594,19 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 				llmClient:            s.scanLLMClientForRequest(req, scanCfg),
 			}
 			s.executeScanSession(subSess)
+			// A child cut short by a stop or a server shutdown is not an
+			// assessed host. Leave the resume index on it (no progress save
+			// below) so the next run continues its saved session; advancing
+			// here dropped the host from the inventory for good.
 			if s.instanceInterrupted(req.InstanceID) {
+				wildcardStopped = true
+				return
+			}
+			if s.serverShuttingDown() || wildcardChildInterrupted(subSess.record) {
+				interruptReason = "server_shutdown"
+				if wildcardChildInterrupted(subSess.record) {
+					interruptReason = subSess.record.StopReason
+				}
 				wildcardStopped = true
 				return
 			}
@@ -1491,6 +1698,10 @@ func (s *Server) runWildcardTarget(ctx context.Context, scanCfg *config.Config, 
 			if status, stopReason := s.instanceRunStatus(req.InstanceID); isInterruptedInstanceStatus(status) {
 				parentRecord.Status = status
 				parentRecord.StopReason = stopReason
+			} else if interruptReason != "" {
+				// Keep the parent recoverable: a shutdown is not a user stop.
+				parentRecord.Status = "stopped"
+				parentRecord.StopReason = interruptReason
 			} else {
 				parentRecord.Status = "stopped"
 				parentRecord.StopReason = "user_stopped"

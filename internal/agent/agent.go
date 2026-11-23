@@ -3,6 +3,7 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -206,6 +207,7 @@ type Agent struct {
 	// flag plus the resolved endpoint, so it is stable for the whole scan.
 	nativeToolCalling          bool
 	nativeToolDefs             []llm.ToolDefinition
+	phasePlaybooks             map[int]phasePlaybook // checklist phases deferred from the system prompt (XALGORIX_PHASE_PLAYBOOKS)
 	registry                   *tools.Registry
 	scanCtx                    *scanctx.ScanContext // per-session state (vulns, notes, terminal, browser)
 	messages                   []llm.Message
@@ -222,6 +224,7 @@ type Agent struct {
 	activityMu                 sync.Mutex
 	scanStart                  time.Time // when Run() was called
 	discoveryMode              bool      // When true, allow finish at any iteration (for Phase 1 enumeration)
+	singleHostScope            bool      // single-target scan: no subdomain discovery or subdomain obligations
 	allowedPhases              []int     // selected methodology phases, empty means all
 	reconMode                  string    // active or passive reconnaissance
 	scanIntensity              string    // active or passive testing/scanning
@@ -497,6 +500,11 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 		scanContext:  cfg.ScanContext,
 		children:     make(map[*Agent]struct{}),
 	}
+	// Redirect hops get the same local-machine and port-pin checks as the
+	// URL a tool is called with, and every direct connection gets the
+	// local-machine check on the address it actually dials.
+	reg.SetRequestGuard(a.checkHTTPHop)
+	reg.SetDialGuard(a.checkDialAddr)
 	if cfg.IterationDelaySec > 0 {
 		a.iterationDelayMs.Store(int64(cfg.IterationDelaySec * 1000))
 	}
@@ -591,6 +599,25 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 	a.registerVerifySSTITool(reg)
 	a.registerVerifyPathTraversalTool(reg)
 
+	// Register the JSON body-contract discovery probe (probe_body_contract):
+	// arjun and the surface machinery only see query/form parameters, so a JSON
+	// API that answers with its own validation error is a dead end. The probe
+	// mutates body fields (remove/add/retype) and diffs the app's status and
+	// error signatures to classify required/recognized/rejected fields, so the
+	// agent can build a valid body and inject into the real parameters.
+	// Agent-bound: needs the scope config, the scan target, and the ledger.
+	a.registerProbeBodyContractTool(reg)
+
+	// Register the deterministic authentication/authorization enforcement-bypass
+	// confirmer (verify_authbypass): the path-shape sibling of authz_matrix.
+	// Given a protected canonical route (or hypothesis), it re-requests the
+	// canonical path unauthenticated as a denied baseline, then tries equivalent
+	// path-shape variants (case fold, percent-encoding, trailing separators)
+	// unauthenticated and without normalization, confirming a bypass only on a
+	// deny→allow status flip whose served body diverges from the denied baseline.
+	// Agent-bound: needs the scope config, the scan target, and the ledger.
+	a.registerVerifyAuthBypassTool(reg)
+
 	// Register the deterministic XML External Entity confirmer (verify_xxe): the
 	// XXE sibling of verify_sqli/verify_ssti. Given a seeded hypothesis or a url,
 	// it sends a randomized benign baseline, a nonexistent-file control, and
@@ -657,6 +684,7 @@ func NewAgent(cfg *config.Config, name string, events chan Event, localGuard sco
 			if a.discoveryMode {
 				subAgent.SetDiscoveryMode(true)
 			}
+			subAgent.SetSingleHostScope(a.singleHostScope)
 			// Role-scoped tool documentation (flag-gated): withhold
 			// role-foreign tool docs from this specialist's prompt. Tools stay
 			// registered/callable and remain listed in a compact index line.
@@ -1261,6 +1289,10 @@ func (a *Agent) PlanWorkedPhases() []int {
 	return phases
 }
 
+// SetSingleHostScope marks a single-target scan: the configured host is the
+// whole scope, so subdomains are not enumerated. Call before Run().
+func (a *Agent) SetSingleHostScope(enabled bool) { a.singleHostScope = enabled }
+
 // SetDiscoveryMode configures the agent to skip minimum iteration checks on finish.
 // Used for Phase 1 subdomain enumeration where we want the agent to exit immediately.
 func (a *Agent) SetDiscoveryMode(enabled bool) {
@@ -1586,6 +1618,14 @@ func (a *Agent) executeToolAsync(toolName string, toolArgs map[string]string) (r
 			}
 		}()
 		res, err := a.registry.Execute(toolName, toolArgs)
+		if a.nativeToolCalling {
+			// The registry words a missing-parameter error with the XML call
+			// syntax; a native model gets the JSON-arguments wording instead.
+			var missing *tools.MissingParamsError
+			if errors.As(err, &missing) {
+				missing.Native = true
+			}
+		}
 		resultCh <- toolExecResult{Result: res, Err: err}
 	}()
 
@@ -1793,6 +1833,8 @@ func (a *Agent) Run(targets []string, instruction string) {
 		a.state.MinIterations = a.cfg.MinIterations
 	}
 	a.state.ScanContextID = a.scanCtx.ID
+	// Recovery nudges word their call instructions for the active channel.
+	a.state.NativeToolCalls = a.nativeToolCalling
 	a.state.DelegatedAgent = a.delegatedAgentID != ""
 	a.state.DelegatedAgentID = a.delegatedAgentID
 	a.state.LaneScoped = a.laneScoped
@@ -1805,6 +1847,7 @@ func (a *Agent) Run(targets []string, instruction string) {
 		a.state.AuthContextAvailable = true
 	}
 	a.state.DiscoveryMode = a.discoveryMode
+	a.state.SingleHostScope = a.singleHostScope && !a.discoveryMode
 	a.state.AllowedPhases = append([]int(nil), a.allowedPhases...)
 	// Derive the explicit depth mode ONCE from the phase selection. Empty
 	// AllowedPhases = the full methodology is allowed = deep requirements
@@ -1925,6 +1968,12 @@ func (a *Agent) Run(targets []string, instruction string) {
 			a.msgMu.Lock()
 			a.messages = append(a.messages, llm.Message{Role: "user", Content: iterResult.Nudge})
 			a.msgMu.Unlock()
+		}
+		// Deferred methodology phases go in now, after this iteration's tool
+		// results and nudges, so the playbook for the work in front of the
+		// agent is in the request it is about to make.
+		if added := a.injectPhasePlaybooks(); len(added) > 0 {
+			log.Printf("[PLAYBOOK] agent %s: added phase playbook(s) %v", a.ID, added)
 		}
 		if iterResult.EmitMessage != "" {
 			a.emit(Event{Type: "message", Content: iterResult.EmitMessage, TotalTokens: tokenCount()})
@@ -2472,6 +2521,17 @@ func (a *Agent) Run(targets []string, instruction string) {
 			// scans, related infrastructure, etc.
 			if blocked, reason := a.shouldBlockForOutOfScope(tc.Name, tc.Args); blocked {
 				blockMsg := "⛔ OUT-OF-SCOPE TARGET BLOCKED — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
+				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
+				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
+				a.appendToolOutcome(tc, blockMsg)
+				continue
+			}
+
+			// ── Target boundary guard ──
+			// The operator's own boundaries: a port named in the target URL,
+			// and single-host scans (target_scope.go).
+			if blocked, reason := a.shouldBlockForTargetScope(tc.Name, tc.Args); blocked {
+				blockMsg := "⛔ OUTSIDE SCAN BOUNDARY — " + reason + noteBlockedToolCall(a.state, tc.Name, tc.Args)
 				a.emit(Event{Type: "tool_call", ToolName: tc.Name, ToolArgs: tc.Args})
 				a.emit(Event{Type: "tool_result", ToolName: tc.Name, ToolResult: tools.Result{Output: blockMsg}, TotalTokens: tokenCount()})
 				a.appendToolOutcome(tc, blockMsg)
